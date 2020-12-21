@@ -119,6 +119,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413588 $")
 				<configOption name="announcement">
 					<synopsis>Sound file to play to the user when they join a conference</synopsis>
 				</configOption>
+				<configOption name="ipn20_announce">
+					<synopsis>IPN20 pretone/announce to play to the user when they join a conference</synopsis>
+				</configOption>
 				<configOption name="denoise">
 					<synopsis>Apply a denoise filter to the audio before mixing</synopsis>
 					<description><para>Sets whether or not a denoise filter should be applied
@@ -1946,6 +1949,7 @@ int conf_load_config(void)
 	aco_option_register(&cfg_info, "pin", ACO_EXACT, user_types, NULL, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct user_profile, pin));
 	aco_option_register(&cfg_info, "music_on_hold_class", ACO_EXACT, user_types, NULL, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct user_profile, moh_class));
 	aco_option_register(&cfg_info, "announcement", ACO_EXACT, user_types, NULL, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct user_profile, announcement));
+	aco_option_register(&cfg_info, "ipn20_announce", ACO_EXACT, user_types, NULL, OPT_CHAR_ARRAY_T, 0, CHARFLDSET(struct user_profile, ipn20_announce));
 	aco_option_register(&cfg_info, "denoise", ACO_EXACT, user_types, "no", OPT_BOOLFLAG_T, 1, FLDSET(struct user_profile, flags), USER_OPT_DENOISE);
 	aco_option_register(&cfg_info, "dsp_drop_silence", ACO_EXACT, user_types, "no", OPT_BOOLFLAG_T, 1, FLDSET(struct user_profile, flags), USER_OPT_DROP_SILENCE);
 	aco_option_register(&cfg_info, "dsp_silence_threshold", ACO_EXACT, user_types, __stringify(DEFAULT_SILENCE_THRESHOLD), OPT_UINT_T, 0, FLDSET(struct user_profile, silence_threshold));

@@ -73,6 +73,15 @@ struct ast_dial *ast_dial_create(void);
  */
 int ast_dial_append(struct ast_dial *dial, const char *tech, const char *device, const struct ast_assigned_ids *assignedids);
 
+/*! \brief AICS Request all appended channels, but do not dial
+ * \param dial Dialing structure
+ * \param chan Optional dialing channel
+ * \param cap Optional requested capabilities
+ * \retval -1 failure
+ * \reval 0 success
+ */
+int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast_format_cap *cap);
+
 /*! \brief Request all appended channels, but do not dial
  * \param dial Dialing structure
  * \param chan Optional dialing channel

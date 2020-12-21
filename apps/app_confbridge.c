@@ -42,6 +42,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428334 $")
 
@@ -1327,8 +1328,149 @@ static struct confbridge_conference *join_conference_bridge(const char *conferen
 
 	ao2_unlock(conference);
 
+//	/* If an ipn20_announce is to be played play it */
+//	if (!ast_strlen_zero(user->u_profile.ipn20_announce)) {
+////		ast_log(LOG_NOTICE, "Confbridge user %s ipn20_announce '%s'\n",user->u_profile.name, user->u_profile.ipn20_announce);
+//
+//		/* AICS announce+pretone */
+//		int was_announce = 0;
+//		char *a_path = pbx_builtin_getvar_helper(user->chan, "AICS_RECORD_PATH");
+//		char *s_cur = NULL, *s_rst = NULL;
+//		s_rst = user->u_profile.ipn20_announce;
+////		ast_log(LOG_NOTICE, "Opt string='%s'\n", s_rst);
+//		while ((s_cur = strsep(&s_rst, "&")) ) {
+//			char *s_func = NULL, *s_arg = NULL;
+//			s_func = s_cur;//s_func = ast_strdupa(s_cur);
+//			while ((s_arg = strsep(&s_func, "'"))) {
+////				ast_log(LOG_NOTICE, "Cur string='%s' a='%s' f='%s' IsA %d IsT %d IsW %d\n", s_cur, s_arg, s_func, strncmp(s_arg, "A", 1), strncmp(s_arg, "T", 1), strncmp(s_arg, "W", 1));
+//				int arg_wait_time = 0;
+//				if (!strncmp(s_arg, "W", 1)) {
+//					if (sscanf(s_arg, "W%30u", &arg_wait_time) == 1) {
+//						arg_wait_time *= 100;
+//						ast_log(LOG_NOTICE, "waiting for %d ms on channel %s\n", arg_wait_time, ast_channel_name(user->chan));
+//						ast_safe_sleep(user->chan, arg_wait_time);
+//					}
+//				} else {
+//					if (!s_func)
+//						break;
+//					char *s_a = NULL, *s_par = NULL;
+//					char a_filename[255] = "\0";
+//					int arg_repeat = 1;
+//					int is_pretone = (strncmp(s_arg, "T", 1) == 0 ? 1 : 0);
+//					was_announce = was_announce + 1 - is_pretone;
+//					s_a = s_func;//s_a = ast_strdupa(s_arg);
+//					s_arg = NULL;
+//					while ((s_par = strsep(&s_a, ";"))) {
+////						ast_log(LOG_NOTICE, "Cur arg='%s' p='%s'\n", s_a, s_par);
+//						if (!s_arg) {
+//							s_arg = strcat(a_filename, a_path);
+//							s_arg = strcat(a_filename, s_par);
+//							size_t a_dot = strcspn(a_filename, ".");
+//							a_filename[a_dot] = '\0';
+//						} else {
+//							if (sscanf(s_par, "R%30u", &arg_repeat) != 1) {
+//
+//							}
+//							arg_repeat = (arg_repeat ? arg_repeat : -1);
+//							if (sscanf(s_a, "W%30u", &arg_wait_time) != 1) {
+//
+//							}
+//							arg_wait_time *= 100;
+//							break;
+//						}
+//					}
+//					ast_log(LOG_NOTICE, "Ready to play %s '%s' for %d times waiting for %d ms on channel %s\n",(is_pretone?"pretone":"announce"), s_arg, arg_repeat, arg_wait_time, ast_channel_name(user->chan));
+//
+//					while (arg_repeat) {
+//						arg_repeat--;
+//						/* stream the file */
+//
+//						if (play_prompt_to_user(user, a_filename)) {
+//							leave_conference(user);
+//							return NULL;
+//						}
+//
+//
+//						if (arg_repeat && arg_wait_time) {
+//							ast_safe_sleep(user->chan, arg_wait_time);
+//						}
+//					}
+//
+//
+//				}
+//				//ast_free(s_a);
+//			}
+//			//ast_free(s_func);
+//		}
+//		//ast_free(s_rst);
+//		if (was_announce) {
+//			leave_conference(user);
+//			return NULL;
+//		}
+///* ~AICS */
+//	}
+
+	/* If an ipn20_announce is to be played play it */
+	struct aics_proxy_params *aproxy = ast_channel_proxy(user->chan);
+	if (aproxy->validity.as_bits.playlist) {
+//		ast_log(LOG_NOTICE, "Confbridge user %s ipn20_announce '%s'\n",user->u_profile.name, user->u_profile.ipn20_announce);
+
+		/* AICS announce+pretone */
+		int was_announce = 0;
+		const char *a_path = pbx_builtin_getvar_helper(user->chan, "AICS_RECORD_PATH");
+
+		struct aics_playlist *head = &aproxy->playlist;
+		if (head) {
+			if (!AST_LIST_EMPTY(&head->playlist)) {
+				struct aics_playlist_item *element;
+				AST_LIST_TRAVERSE(&head->playlist, element, next) {
+					//ast_log(LOG_NOTICE, "element %c %s %d %d \n", element->function, element->filename, element->repeat, element->wait);
+					int arg_wait_time = 100*element->wait;
+					if (element->function == 'W') {
+						ast_log(LOG_NOTICE, "waiting for %d ms on channel %s\n", arg_wait_time, ast_channel_name(user->chan));
+						ast_safe_sleep(user->chan, arg_wait_time);
+					} else {
+						int arg_repeat = element->repeat;
+						int is_pretone = (element->function == 'T' ? 1 : 0);
+						char a_filename[255] = "\0";
+						strcat(a_filename, a_path);
+						strcat(a_filename, element->filename);
+						size_t a_dot = strcspn(a_filename, ".");
+						a_filename[a_dot] = '\0';
+						was_announce = was_announce + 1 - is_pretone;
+						ast_log(LOG_NOTICE, "Ready to play %s '%s' for %d times waiting for %d ms\n",(is_pretone?"pretone":"announce"), a_filename, arg_repeat, arg_wait_time);
+
+						while (arg_repeat) {
+							arg_repeat--;
+							/* stream the file */
+
+							if (play_prompt_to_user(user, a_filename)) {
+								leave_conference(user);
+								return NULL;
+							}
+
+
+							if (arg_repeat && arg_wait_time) {
+								ast_safe_sleep(user->chan, arg_wait_time);
+							}
+						}
+
+
+					}
+				} //traverse
+			}
+		}
+
+		if (was_announce) {
+			leave_conference(user);
+			return NULL;
+		}
+/* ~AICS */
+	}
+
 	/* If an announcement is to be played play it */
 	if (!ast_strlen_zero(user->u_profile.announcement)) {
+//		ast_log(LOG_NOTICE, "Confbridge user %s announce '%s'\n",user->u_profile.name, user->u_profile.announcement);
 		if (play_prompt_to_user(user,
 			user->u_profile.announcement)) {
 			leave_conference(user);
@@ -1594,7 +1736,7 @@ static int confbridge_exec(struct ast_channel *chan, const char *data)
 		AST_APP_ARG(u_profile_name);
 		AST_APP_ARG(menu_name);
 	);
-
+	ast_log(LOG_NOTICE,"Enter Chan %s data %s\n",ast_channel_name(chan), data);
 	if (ast_channel_state(chan) != AST_STATE_UP) {
 		ast_answer(chan);
 	}
@@ -1814,6 +1956,7 @@ static int confbridge_exec(struct ast_channel *chan, const char *data)
 	}
 
 confbridge_cleanup:
+ast_log(LOG_NOTICE,"Exit Chan %s data %s\n",ast_channel_name(chan), data);
 	ast_bridge_features_cleanup(&user.features);
 	conf_bridge_profile_destroy(&user.b_profile);
 	return res;

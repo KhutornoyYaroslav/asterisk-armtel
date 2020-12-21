@@ -125,6 +125,7 @@ enum {
 	OPTION_KEEP = (1 << 6),
 	FLAG_HAS_PERCENT = (1 << 7),
 	OPTION_ANY_TERMINATE = (1 << 8),
+	OPTION_IPN_PARROT = (1 << 9),
 };
 
 AST_APP_OPTIONS(app_opts,{
@@ -136,6 +137,7 @@ AST_APP_OPTIONS(app_opts,{
 	AST_APP_OPTION('t', OPTION_STAR_TERMINATE),
 	AST_APP_OPTION('y', OPTION_ANY_TERMINATE),
 	AST_APP_OPTION('x', OPTION_IGNORE_TERMINATE),
+	AST_APP_OPTION('i', OPTION_IPN_PARROT),
 });
 
 static int record_exec(struct ast_channel *chan, const char *data)
@@ -335,7 +337,10 @@ static int record_exec(struct ast_channel *chan, const char *data)
 
 	start = ast_tvnow();
 	while ((ms = ast_remaining_ms(start, maxduration))) {
-		ms = ast_waitfor(chan, ms);
+		if (ast_test_flag(&flags, OPTION_IPN_PARROT)) 
+		    ms = ast_waitfor(chan, 50);
+        else
+		    ms = ast_waitfor(chan, ms);
 		if (ms < 0) {
 			break;
 		}

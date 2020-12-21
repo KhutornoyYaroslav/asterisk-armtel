@@ -31,6 +31,7 @@
 
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 421234 $")
 
@@ -611,6 +612,7 @@ enum {
 #define OPT_CALLER_ANSWER    (1LLU << 40)
 #define OPT_PREDIAL_CALLEE   (1LLU << 41)
 #define OPT_PREDIAL_CALLER   (1LLU << 42)
+#define OPT_IPN20_ANNOUNCE	 (1LLU << 43)
 
 enum {
 	OPT_ARG_ANNOUNCE = 0,
@@ -632,6 +634,7 @@ enum {
 	OPT_ARG_FORCE_CID_PRES,
 	OPT_ARG_PREDIAL_CALLEE,
 	OPT_ARG_PREDIAL_CALLER,
+	OPT_ARG_IPN20_ANNOUNCE,
 	/* note: this entry _MUST_ be the last one in the enum */
 	OPT_ARG_ARRAY_SIZE,
 };
@@ -677,6 +680,7 @@ AST_APP_OPTIONS(dial_exec_options, BEGIN_OPTIONS
 	AST_APP_OPTION('x', OPT_CALLEE_MIXMONITOR),
 	AST_APP_OPTION('X', OPT_CALLER_MIXMONITOR),
 	AST_APP_OPTION('z', OPT_CANCEL_TIMEOUT),
+	AST_APP_OPTION_ARG('Q', OPT_IPN20_ANNOUNCE, OPT_ARG_IPN20_ANNOUNCE),
 END_OPTIONS );
 
 #define CAN_EARLY_BRIDGE(flags,chan,peer) (!ast_test_flag64(flags, OPT_CALLEE_HANGUP | \
@@ -2733,6 +2737,279 @@ static int dial_exec_full(struct ast_channel *chan, const char *data, struct ast
 				goto out;
 			}
 		}
+
+
+//		/* AICS announce+pretone */
+//		if (!ast_test_flag64(&opts, OPT_IPN20_ANNOUNCE) || ast_strlen_zero(opt_args[OPT_ARG_IPN20_ANNOUNCE])) {
+//			res = 0;
+//		} else {
+//			int digit = 0;
+//			struct ast_channel *chans[2];
+//			struct ast_channel *active_chan;
+//
+//			chans[0] = chan;
+//			chans[1] = peer;
+//
+//			int was_announce = 0;
+//			char *a_path = pbx_builtin_getvar_helper(peer, "AICS_RECORD_PATH");
+//			char *s_cur = NULL, *s_rst = NULL;
+//			s_rst = opt_args[OPT_ARG_IPN20_ANNOUNCE];//s_rst = ast_strdupa(opt_args[OPT_ARG_ANNOUNCE]);
+////			ast_log(LOG_NOTICE, "Opt string='%s'\n", s_rst);
+//			while ((s_cur = strsep(&s_rst, "&")) ) {
+//				char *s_func = NULL, *s_arg = NULL;
+//				s_func = s_cur;//s_func = ast_strdupa(s_cur);
+//				while ((s_arg = strsep(&s_func, "'"))) {
+////					ast_log(LOG_NOTICE, "Cur string='%s' a='%s' f='%s' IsA %d IsT %d IsW %d\n", s_cur, s_arg, s_func, strncmp(s_arg, "A", 1), strncmp(s_arg, "T", 1), strncmp(s_arg, "W", 1));
+//					int arg_wait_time = 0;
+//					if (!strncmp(s_arg, "W", 1)) {
+//						if (sscanf(s_arg, "W%30u", &arg_wait_time) == 1) {
+//							arg_wait_time *= 100;
+//							ast_log(LOG_NOTICE, "waiting for %d ms on channel %s\n", arg_wait_time, ast_channel_name(chan));
+//							ast_safe_sleep(chan, arg_wait_time);
+//						}
+//					} else {
+//						if (!s_func)
+//							break;
+//						char *s_a = NULL, *s_par = NULL;
+//						char a_filename[255] = "\0";
+//						int arg_repeat = 1;
+//						int is_pretone = (strncmp(s_arg, "T", 1) == 0 ? 1 : 0);
+//						was_announce = was_announce + 1 - is_pretone;
+//						s_a = s_func;//s_a = ast_strdupa(s_arg);
+//						s_arg = NULL;
+//						while ((s_par = strsep(&s_a, ";"))) {
+////							ast_log(LOG_NOTICE, "Cur arg='%s' p='%s'\n", s_a, s_par);
+//							if (!s_arg) {
+//								s_arg = strcat(a_filename, a_path);
+//								s_arg = strcat(a_filename, s_par);
+//								size_t a_dot = strcspn(a_filename, ".");
+//								a_filename[a_dot] = '\0';
+//							} else {
+//								if (sscanf(s_par, "R%30u", &arg_repeat) != 1) {
+//
+//								}
+//								arg_repeat = (arg_repeat ? arg_repeat : -1);
+//								if (sscanf(s_a, "W%30u", &arg_wait_time) != 1) {
+//
+//								}
+//								arg_wait_time *= 100;
+//								break;
+//							}
+//						}
+//						ast_log(LOG_NOTICE, "Ready to play %s '%s' for %d times waiting for %d ms\n",(is_pretone?"pretone":"announce"), s_arg, arg_repeat, arg_wait_time);
+//
+//						while (arg_repeat) {
+//							arg_repeat--;
+//							/* stream the file */
+//							if (is_pretone) {
+//								res = ast_streamfile(chan, a_filename, ast_channel_language(peer));
+//								if (res) {
+//									res = 0;
+//									ast_log(LOG_ERROR, "error streaming file '%s' to caller\n", a_filename);
+//								}
+//
+//							}
+//							res = ast_streamfile(peer, a_filename, ast_channel_language(peer));
+//							if (res) {
+//								res = 0;
+//								ast_log(LOG_ERROR, "error streaming file '%s' to callee\n", a_filename);
+//							}
+//
+//
+//							ast_set_flag(ast_channel_flags(peer), AST_FLAG_END_DTMF_ONLY);
+//							while (ast_channel_stream(peer)) {
+//								int ms;
+//
+//								ms = ast_sched_wait(ast_channel_sched(peer));
+//
+//								if (ms < 0 && !ast_channel_timingfunc(peer)) {
+//									ast_stopstream(peer);
+//									break;
+//								}
+//								if (ms < 0)
+//									ms = 1000;
+//
+//								active_chan = ast_waitfor_n(chans, 2, &ms);
+//								if (active_chan) {
+//									struct ast_frame *fr = ast_read(active_chan);
+//									if (!fr) {
+//										ast_autoservice_chan_hangup_peer(chan, peer);
+//										res = -1;
+//										goto done;
+//									}
+//									switch(fr->frametype) {
+//										case AST_FRAME_DTMF_END:
+//											digit = fr->subclass.integer;
+//											if (active_chan == peer && strchr(AST_DIGIT_ANY, res)) {
+//												ast_stopstream(peer);
+//												res = ast_senddigit(chan, digit, 0);
+//											}
+//											break;
+//										case AST_FRAME_CONTROL:
+//											switch (fr->subclass.integer) {
+//												case AST_CONTROL_HANGUP:
+//													ast_frfree(fr);
+//													ast_autoservice_chan_hangup_peer(chan, peer);
+//													res = -1;
+//													goto done;
+//												default:
+//													break;
+//											}
+//											break;
+//										default:
+//											/* Ignore all others */
+//											break;
+//									}
+//									ast_frfree(fr);
+//								}
+//								ast_sched_runq(ast_channel_sched(peer));
+//							}
+//							ast_clear_flag(ast_channel_flags(peer), AST_FLAG_END_DTMF_ONLY);
+//
+//							if (arg_repeat && arg_wait_time) {
+//								ast_safe_sleep(peer, arg_wait_time);
+//							}
+//						}
+//
+//
+//					}
+//					//ast_free(s_a);
+//				}
+//				//ast_free(s_func);
+//			}
+//			//ast_free(s_rst);
+//
+//			if (was_announce) {
+//				ast_autoservice_chan_hangup_peer(chan, peer);
+//				res = -1;
+//				goto done;
+//			}
+//		}
+///* ~AICS */
+
+		/* AICS announce+pretone */
+		struct aics_proxy_params *aproxy = ast_channel_proxy(chan);
+		if (!aproxy->validity.as_bits.playlist) {
+			res = 0;
+		} else {
+			int digit = 0;
+			struct ast_channel *chans[2];
+			struct ast_channel *active_chan;
+
+			chans[0] = chan;
+			chans[1] = peer;
+
+			int was_announce = 0;
+			const char *a_path = pbx_builtin_getvar_helper(peer, "AICS_RECORD_PATH");
+
+			struct aics_playlist *head = &aproxy->playlist;
+			if (head) {
+				if (!AST_LIST_EMPTY(&head->playlist)) {
+					struct aics_playlist_item *element;
+					AST_LIST_TRAVERSE(&head->playlist, element, next) {
+				//		ast_log(LOG_NOTICE, "element %c %s %d %d \n", element->function, element->filename, element->repeat, element->wait);
+						int arg_wait_time = 100*element->wait;
+						if (element->function == 'W') {
+							ast_log(LOG_NOTICE, "waiting for %d ms on channel %s\n", arg_wait_time, ast_channel_name(chan));
+							ast_safe_sleep(chan, arg_wait_time);
+						} else {
+							int arg_repeat = element->repeat;
+							int is_pretone = (element->function == 'T' ? 1 : 0);
+							char a_filename[255] = "\0";
+							strcat(a_filename, a_path);
+							strcat(a_filename, element->filename);
+							size_t a_dot = strcspn(a_filename, ".");
+							a_filename[a_dot] = '\0';
+							was_announce = was_announce + 1 - is_pretone;
+							ast_log(LOG_NOTICE, "Ready to play %s '%s' for %d times waiting for %d ms\n",(is_pretone?"pretone":"announce"), a_filename, arg_repeat, arg_wait_time);
+
+							while (arg_repeat) {
+								arg_repeat--;
+								/* stream the file */
+								if (is_pretone) {
+									res = ast_streamfile(chan, a_filename, ast_channel_language(peer));
+									if (res) {
+										res = 0;
+										ast_log(LOG_ERROR, "error streaming file '%s' to caller\n", a_filename);
+									}
+
+								}
+								res = ast_streamfile(peer, a_filename, ast_channel_language(peer));
+								if (res) {
+									res = 0;
+									ast_log(LOG_ERROR, "error streaming file '%s' to callee\n", a_filename);
+								}
+
+
+								ast_set_flag(ast_channel_flags(peer), AST_FLAG_END_DTMF_ONLY);
+								while (ast_channel_stream(peer)) {
+									int ms;
+
+									ms = ast_sched_wait(ast_channel_sched(peer));
+
+									if (ms < 0 && !ast_channel_timingfunc(peer)) {
+										ast_stopstream(peer);
+										break;
+									}
+									if (ms < 0)
+										ms = 1000;
+
+									active_chan = ast_waitfor_n(chans, 2, &ms);
+									if (active_chan) {
+										struct ast_frame *fr = ast_read(active_chan);
+										if (!fr) {
+											ast_autoservice_chan_hangup_peer(chan, peer);
+											res = -1;
+											goto done;
+										}
+										switch(fr->frametype) {
+											case AST_FRAME_DTMF_END:
+												digit = fr->subclass.integer;
+												if (active_chan == peer && strchr(AST_DIGIT_ANY, res)) {
+													ast_stopstream(peer);
+													res = ast_senddigit(chan, digit, 0);
+												}
+												break;
+											case AST_FRAME_CONTROL:
+												switch (fr->subclass.integer) {
+													case AST_CONTROL_HANGUP:
+														ast_frfree(fr);
+														ast_autoservice_chan_hangup_peer(chan, peer);
+														res = -1;
+														goto done;
+													default:
+														break;
+												}
+												break;
+											default:
+												/* Ignore all others */
+												break;
+										}
+										ast_frfree(fr);
+									}
+									ast_sched_runq(ast_channel_sched(peer));
+								}
+								ast_clear_flag(ast_channel_flags(peer), AST_FLAG_END_DTMF_ONLY);
+
+								if (arg_repeat && arg_wait_time) {
+									ast_safe_sleep(peer, arg_wait_time);
+								}
+							}
+
+
+						}
+					} //traverse
+				}
+			}
+
+			if (was_announce) {
+				ast_autoservice_chan_hangup_peer(chan, peer);
+				res = -1;
+				goto done;
+			}
+		} // else
+/* ~AICS */
+
 		if (!ast_test_flag64(&opts, OPT_ANNOUNCE) || ast_strlen_zero(opt_args[OPT_ARG_ANNOUNCE])) {
 			res = 0;
 		} else {

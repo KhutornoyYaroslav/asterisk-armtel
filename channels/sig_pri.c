@@ -120,6 +120,47 @@
 #error "Upgrade your libpri"
 #endif
 
+#ifdef PRI_ARMTEL_EXT
+
+#define ARMTEL_DAHDI_EXT_VER "Armtel extension DAHDI 1.03"
+
+#define ARMTEL_NUM_LEN 7
+#define ARMTEL_HINT_LEN 7
+#define ARMTEL_TIME_CNT 2
+
+//static int armtel_resample=0;
+
+struct st_buf {
+	char buf[32]; /* buffer state subscriber */
+	unsigned char len;             /* len buffer*/
+};
+struct indication {
+	struct ast_str* num; /* number subscriber */
+	int idx;             /* index to numbering plan*/
+};
+static struct armtel_ind{
+   struct ao2_container *ind; /*numbering plan*/
+//   struct ast_str *buf;       /* buffer state subscriber */
+   struct st_buf sbuf;
+   struct ast_str *nsw;       /* number switch*/
+   int timer;
+
+}armtel_out_ind={NULL,NULL,NULL,0};
+
+static struct inp_ind{
+	   struct ao2_container *sw;
+}armtel_inp_ind;
+static char asterisk_num[ARMTEL_NUM_LEN]={0};
+static char armtel_hint[ARMTEL_NUM_LEN + ARMTEL_HINT_LEN]="DAHDI/";
+static int armtel_dbg=0;
+static int armtel_cfg=0;
+static int armtel_activ=0;
+static int armtel_len_hint=6;
+static int armtel_bandwidth=0;
+static int armtel_span=-1;
+
+#endif
+
 /*** DOCUMENTATION
  ***/
 
@@ -225,6 +266,7 @@ static unsigned int PVT_TO_CHANNEL(struct sig_pri_chan *p)
 
 static void sig_pri_handle_dchan_exception(struct sig_pri_span *pri, int index)
 {
+
 	if (sig_pri_callbacks.handle_dchan_exception) {
 		sig_pri_callbacks.handle_dchan_exception(pri, index);
 	}
@@ -1441,6 +1483,7 @@ static int pri_find_principle_by_call(struct sig_pri_span *pri, q931_call *call)
 		/* Cannot find a call without a call. */
 		return -1;
 	}
+
 	for (idx = 0; idx < pri->numchans; ++idx) {
 		if (pri->pvts[idx] && pri->pvts[idx]->call == call) {
 			/* Found the principle */
@@ -5757,6 +5800,597 @@ static void sig_pri_handle_retrieve_rej(struct sig_pri_span *pri, pri_event *ev)
 }
 #endif	/* defined(HAVE_PRI_CALL_HOLD) */
 
+#ifdef PRI_ARMTEL_EXT
+void armtel_data_destructor(void);
+int armtel_idx_cmp(void *obj,void* arg, int flag);
+struct indication * find_in_container_str(struct ao2_container * cont,const char* data);
+struct armtel_ind * find_in_container_inp_str(struct ao2_container * cont,const char* data);
+struct indication * find_in_container_idx(struct ao2_container * cont, int idx);
+struct indication * get_first_obj(struct ao2_container * cont);
+struct indication * add_to_container(struct ao2_container * cont, const char *data );
+struct armtel_ind* add_to_container_inp(struct ao2_container * cont, const char *data );
+void armtel_set_out_ind(const char *num,int state);
+int callback1_state(  char* con,char *id, struct ast_state_cb_info *info, void* data);
+void str_to_hex(char* hex ,char* str,unsigned char len);
+unsigned char armtel_get_state(unsigned char* buf, int idx);
+//void armtel_set_sign(struct ast_channel* ast,unsigned char cmd,unsigned char prio,unsigned char context);
+
+
+//void armtel_set_sign(struct ast_channel* ast,unsigned char cmd,unsigned char prio,unsigned char context)
+//{
+//	   aics_send_armtel_sign(ast,cmd,prio,context);
+//}
+
+unsigned char armtel_context_from_aisc(enum aics_direction dir,enum aics_scenario sce)
+{
+	switch(dir){
+	case  AICS_DIRECTION_DUPLEX:
+		switch(sce){
+		case  AICS_SCENARIO_NONE:
+			return ARMTEL_CONTEXT_DUPLEX;
+		case  AICS_SCENARIO_GROUP:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CONFERENCE:
+			return ARMTEL_CONTEXT_DUPLEX;
+		case  AICS_SCENARIO_SELECTOR:
+			return ARMTEL_CONTEXT_CELECTOR;
+		case  AICS_SCENARIO_CIRCULAR:
+			return ARMTEL_CONTEXT_CYRCULAR;
+		}
+		break;
+	case  AICS_DIRECTION_SEND:
+		switch(sce){
+		case  AICS_SCENARIO_NONE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_GROUP:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CONFERENCE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_SELECTOR:
+			return ARMTEL_CONTEXT_CELECTOR;
+		case  AICS_SCENARIO_CIRCULAR:
+			return ARMTEL_CONTEXT_CYRCULAR;
+		}
+		break;
+	case  AICS_DIRECTION_RECV:
+		switch(sce){
+		case  AICS_SCENARIO_NONE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_GROUP:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CONFERENCE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_SELECTOR:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CIRCULAR:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		}
+		break;
+	case  AICS_DIRECTION_MUTE:
+		switch(sce){
+		case  AICS_SCENARIO_NONE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_GROUP:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CONFERENCE:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_SELECTOR:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		case  AICS_SCENARIO_CIRCULAR:
+			return ARMTEL_CONTEXT_SIMPLEX;
+		}
+		break;
+	}
+	return ARMTEL_CONTEXT_SIMPLEX;
+}
+enum aics_direction armtel_context_to_aisc(unsigned char context,enum aics_scenario *sce)
+{
+	enum aics_direction dir = AICS_DIRECTION_SEND;
+	*sce=AICS_SCENARIO_NONE;
+	switch(context){
+	case ARMTEL_CONTEXT_DUPLEX:
+		dir = AICS_DIRECTION_DUPLEX;
+		break;
+	case ARMTEL_CONTEXT_SIMPLEX:
+	    break;
+	case ARMTEL_CONTEXT_TONE_DUPLEX:
+	    break;
+	case ARMTEL_CONTEXT_CYRCULAR:
+	   dir= AICS_DIRECTION_RECV;
+	   *sce=AICS_SCENARIO_CIRCULAR;
+	   break;
+	case ARMTEL_CONTEXT_CELECTOR:
+	   dir= AICS_DIRECTION_RECV;
+	   *sce=AICS_SCENARIO_SELECTOR;
+	   break;
+	case ARMTEL_CONTEXT_CONF:
+		dir = AICS_DIRECTION_DUPLEX;
+	   break;
+	case ARMTEL_CONTEXT_LISTEN:
+	   break;
+	case ARMTEL_CONTEXT_ONLY_SIMPLEX:
+	   break;
+	case ARMTEL_CONTEXT_TALK_BACK:
+	   break;
+	}
+
+   return dir;
+}
+
+
+int armtel_get_debug()
+{
+	return armtel_dbg;
+}
+static int armtel_out_ind_hash(const void *obj,const int flag)
+{
+	const struct indication * ind =obj;
+	return ast_str_hash(ind->num->str);
+
+}
+static int armtel_out_ind_cmp( void *obj,void* arg, int flag)
+{
+	struct indication * ind1 =obj;
+	struct indication * ind2 =arg;
+    return(!strcmp(ind1->num->str,ind2->num->str)) ?(CMP_MATCH | CMP_STOP) : 0;
+}
+static int armtel_inp_ind_hash(const void *obj,const int flag)
+{
+	const struct armtel_ind * ind =obj;
+	return ast_str_hash(ind->nsw->str);
+
+}
+static int armtel_inp_ind_cmp( void *obj,void* arg, int flag)
+{
+	struct armtel_ind * ind1 =obj;
+	struct armtel_ind * ind2 =arg;
+    return(!strcmp(ind1->nsw->str,ind2->nsw->str)) ?(CMP_MATCH | CMP_STOP) : 0;
+}
+static void armtel_ind_destructor(void* obj)
+{
+	struct indication * ind =obj;
+
+    ast_free(ind->num);
+}
+static void armtel_ind2_destructor(void* obj)
+{
+	   struct armtel_ind *af=obj;
+
+       ast_free(af->nsw);
+ //      ast_free(af->buf);
+   	   ao2_ref(af->ind,-1);
+}
+void armtel_data_destructor(void)
+{
+
+    ao2_lock(armtel_out_ind.ind);
+	ao2_ref(armtel_out_ind.ind,-1);
+//    ast_free(armtel_out_ind.buf);
+    ast_free(armtel_out_ind.nsw);
+    ao2_lock(armtel_inp_ind.sw);
+	ao2_ref(armtel_inp_ind.sw,-1);
+
+
+}
+
+int armtel_idx_cmp(void *obj,void* arg, int flag)
+{
+	struct indication *ind =obj;
+    return(ind->idx == (int)arg ? CMP_MATCH | CMP_STOP :0);
+}
+
+
+struct indication * find_in_container_str(struct ao2_container * cont,const char* data)
+{
+	struct indication ind;
+	struct indication *f;
+
+	  ind.num=ast_str_create(strlen(data));
+	  ast_str_set(&ind.num,0,data);
+	  f=ao2_find(cont,&ind,OBJ_POINTER);
+	  return(f);
+}
+struct armtel_ind * find_in_container_inp_str(struct ao2_container * cont,const char* data)
+{
+	struct armtel_ind ind;
+	struct armtel_ind *f;
+
+	  ind.nsw=ast_str_create(strlen(data));
+	  ast_str_set(&ind.nsw,0,data);
+	  f=ao2_find(cont,&ind,OBJ_POINTER);
+	  return(f);
+}
+struct indication * find_in_container_idx(struct ao2_container * cont, int idx)
+{
+  struct indication *f=NULL;
+	   f=ao2_callback(cont,0,armtel_idx_cmp,(void*)idx);
+	  return(f);
+}
+struct indication * get_first_obj(struct ao2_container * cont)
+{
+	struct indication * f;
+    f=ao2_callback(cont,0,armtel_idx_cmp,0);
+    return(f);
+}
+struct indication * add_to_container(struct ao2_container * cont, const char *data )
+{
+	struct indication *ind=NULL;
+	int cnt=ao2_container_count(cont);;
+	ind=ao2_alloc(sizeof(*ind),armtel_ind_destructor);
+	if(ind){
+	  ind->num=ast_str_create(strlen(data));
+	  ast_str_set(&ind->num,0,data);
+      ind->idx=cnt;
+      ao2_link(cont,ind);
+	}
+	return ind;
+}
+struct armtel_ind* add_to_container_inp(struct ao2_container * cont, const char *data )
+{
+	struct armtel_ind *ind=NULL;
+
+	ind=ao2_alloc(sizeof(*ind),armtel_ind2_destructor);
+	if(ind){
+	  ind->nsw=ast_str_create(strlen(data));
+	  ast_str_set(&ind->nsw,0,data);
+      ao2_link(cont,ind);
+	}
+	return ind;
+}
+
+void armtel_set_out_ind(const char *num,int state)
+{
+struct indication *f;
+int idx,byte,bit;
+//ast_verbose("!!event from Asterisk: num =%s state =%d\n",num,state);
+
+  f=find_in_container_str(armtel_out_ind.ind,num);
+  if(f){
+   idx = f->idx;
+   byte = idx/8;
+   bit = idx%8;
+    if(state) armtel_out_ind.sbuf.buf[byte] |=(1<<bit);
+    else armtel_out_ind.sbuf.buf[byte] &=~(1<<bit);
+    if(armtel_dbg)
+      ast_verbose("event from Asterisk: num =%s state =%d\n",num,state);
+
+    ao2_ref(f, -1);
+  }
+}
+
+int callback1_state(  char* con,char *id, struct ast_state_cb_info *info, void* data)
+{
+	armtel_set_out_ind(id,info->exten_state);
+    return 0;
+}
+
+void str_to_hex(char* hex ,char* str,unsigned char len )
+{
+	int i,k=0,j;
+	if (len) j=len;
+	else j=strlen(str);
+	if(j>32) j=32;
+
+	for(i=0;i<j;i++) k+=sprintf(hex+k,"%3x",(unsigned char)*str++);
+    *(hex+k)=0;
+}
+
+int armtel_load(const char *name,int reload)
+{
+	struct ast_config *cfg;
+	struct ast_variable *v;
+	struct ast_flags config_flags = { reload == 1 ? CONFIG_FLAG_FILEUNCHANGED : 0 };
+	int i,cnt=0;
+    char *c;
+    struct indication *f;
+    struct armtel_ind *af;
+    struct ao2_iterator j;//,k;
+  //  char buf[24]="301";
+
+
+	cfg = ast_config_load(name,config_flags);
+	if( !cfg ) {
+		ast_log(LOG_ERROR, "Unable to load config %s\n",name);
+		return -1;
+	}
+	else if( cfg == CONFIG_STATUS_FILEUNCHANGED ) {
+		ast_verbose( "IPN: config file is unchanged.\n");
+		return 1;
+	}
+	else if( cfg == CONFIG_STATUS_FILEINVALID ) {
+		ast_log(LOG_ERROR, "Contents of %s are invalid and cannot be parsed\n", name );
+		return 1;
+	}
+	for( v=ast_variable_browse(cfg,"general"); v; v=v->next ) {
+		if (!strcasecmp(v->name, "num")) {
+		   ast_copy_string(asterisk_num,v->value,ARMTEL_NUM_LEN);
+		}
+		if (!strcasecmp(v->name, "armtel")) {
+			armtel_activ =0;
+			pri_armtel_block_error(1);
+			if (!strcasecmp(v->value, "on")) {
+				armtel_activ =1;
+				pri_armtel_block_error(0);
+			}
+		}
+		if (!strcasecmp(v->name, "bandwidth")) {
+			armtel_bandwidth =0;
+			if (!strcasecmp(v->value, "7")) {
+				armtel_bandwidth =1;
+			}
+		}
+		if (!strcasecmp(v->name, "span")) {
+			armtel_span =-1;
+			armtel_span = atoi(v->value);
+		}
+		if (!strcasecmp(v->name, "hint")) {
+				ast_copy_string(armtel_hint,v->value,ARMTEL_HINT_LEN);
+				armtel_len_hint=strlen(v->value);
+		}
+	}
+
+	armtel_out_ind.ind=ao2_container_alloc(100,armtel_out_ind_hash,armtel_out_ind_cmp);
+	ao2_lock(armtel_out_ind.ind);
+ // init data armtel output net indication
+	for( v=ast_variable_browse(cfg,"plan"); v; v=v->next ) {
+		// init numbers
+	   if (!strcasecmp(v->name, "pln")) {
+	//	 ast_verbose("Armtel: %s = %s\n", v->name, v->value );
+		 f=find_in_container_str(armtel_out_ind.ind,v->value);
+		 if(!(f))add_to_container(armtel_out_ind.ind,v->value);
+		 else ao2_ref(f, -1);
+	   }
+	}
+	i=ast_extension_state_add(NULL,NULL,callback1_state,NULL);
+   // init packet state subscribers
+	i=ao2_container_count(armtel_out_ind.ind);
+	if(i){
+	  cnt=i/8;
+	  if(i%8) cnt++;
+	  armtel_out_ind.sbuf.len=cnt;
+      for(i=0; i<armtel_out_ind.sbuf.len ;i++) armtel_out_ind.sbuf.buf[i]=0xFF;
+	}
+	ao2_unlock(armtel_out_ind.ind);
+
+	armtel_inp_ind.sw=ao2_container_alloc(100,armtel_inp_ind_hash,armtel_inp_ind_cmp);
+// init data armtel input net indication
+	ao2_lock(armtel_inp_ind.sw);
+	for( v=ast_variable_browse(cfg,"net"); v; v=v->next ) {
+	  if (!strcasecmp(v->name, "net")) {
+		//ast_verbose("Armtel: %s = %s\n", v->name, v->value );
+		if ((c = strchr(v->value, ','))) {
+			*c=0;
+			af=find_in_container_inp_str(armtel_inp_ind.sw,c+1);
+            if(af){
+            	if(af->ind == NULL)	af->ind=ao2_container_alloc(100,armtel_out_ind_hash,armtel_out_ind_cmp);
+        		add_to_container(af->ind,v->value);
+        		ao2_ref(af, -1);
+            }
+            else{
+        		af =add_to_container_inp(armtel_inp_ind.sw,c+1);
+        		af->ind=ao2_container_alloc(100,armtel_out_ind_hash,armtel_out_ind_cmp);
+        		if(af)add_to_container(af->ind,v->value);
+            }
+		}
+	  }
+	}
+    j=ao2_iterator_init(armtel_inp_ind.sw,0);
+    while((af=ao2_iterator_next(&j))){
+    	i=ao2_container_count(af->ind);
+    	if(i){
+    	  cnt=i/8;
+    	  if(i%8) cnt++;
+    	  af->sbuf.len=cnt;
+          for(i=0; i<af->sbuf.len ;i++) af->sbuf.buf[i]=0xFF;
+    	}
+    	ao2_ref(af, -1);
+    }
+	ao2_unlock(armtel_inp_ind.sw);
+	ao2_iterator_destroy(&j);
+	armtel_cfg=1;
+	return 0;
+}
+
+
+void armtel_reload()
+{
+	ast_verbose("-------Armtel: reload\n");
+	armtel_cfg=0;
+	armtel_data_destructor();
+	armtel_load(ARMTEL_FILE_CONFIG,0);
+
+}
+void armtel_debug(int state)
+{
+	ast_verbose("-------Armtel: debug %d", state );
+	armtel_dbg=state;
+
+}
+unsigned char armtel_get_state(unsigned char* buf, int idx)
+{
+	int byte,bit;
+	byte = idx/8;
+	bit = idx%8;
+	if(buf[byte] & (1<<bit)) return 1;
+	else return 0;
+}
+int armtel_get_bandwidth()
+{
+	return armtel_bandwidth;
+}
+//int armtel_get_resample()
+//{
+//	return armtel_resample;
+//}
+int armtel_get_hint(char* hint,char* num)
+{
+struct ao2_iterator i;//,j;
+struct indication *f;
+struct armtel_ind * sw= NULL;
+int idx,byte,bit;
+char hex[128];//,*c;
+
+
+    ao2_lock(armtel_inp_ind.sw);
+    i=ao2_iterator_init(armtel_inp_ind.sw,0);
+    while((sw=ao2_iterator_next(&i))){
+//    	 ast_verbose("----switch=%s\n",sw->nsw->str);
+    	 f=find_in_container_str(sw->ind,num);
+         if(f){
+              idx = f->idx;
+              byte = idx/8;
+              bit = idx%8;
+    	        str_to_hex(hex,sw->sbuf.buf,sw->sbuf.len);
+                sw->sbuf.buf[byte] &=~(1<<bit);
+    	        str_to_hex(hex,sw->sbuf.buf,sw->sbuf.len);
+      			ast_copy_string(&armtel_hint[armtel_len_hint],num,ARMTEL_HINT_LEN+ARMTEL_NUM_LEN);
+      			ast_copy_string(hint ,armtel_hint,ARMTEL_HINT_LEN+ARMTEL_NUM_LEN);
+      			ao2_unlock(armtel_inp_ind.sw);
+      			ao2_ref(f, -1);
+      			ao2_ref(sw, -1);
+                return -1;
+
+         }
+		ao2_ref(sw, -1);
+    }
+    ao2_unlock(armtel_inp_ind.sw);
+    ao2_iterator_destroy(&i);
+    return 0;
+}
+
+void armtel_show()
+{
+	struct indication * ind= NULL;
+	struct armtel_ind * sw= NULL;
+    struct ao2_iterator i,j;
+    char hex[128];//,*c;
+    ast_verbose("===%s(%s)=======\n",ARMTEL_DAHDI_EXT_VER,pri_get_armtel_ver_ext());
+
+    ast_verbose("-----------Armtel output indication\n");
+//    ao2_container_count
+     ao2_lock(armtel_out_ind.ind);
+     i=ao2_iterator_init(armtel_out_ind.ind,0);
+      ast_verbose("----asterisk=%s\n",asterisk_num);
+      while((ind=ao2_iterator_next(&i))){
+    	    ast_verbose("%s[%d]=%d\n",ind->num->str,ind->idx,armtel_get_state((unsigned char*)armtel_out_ind.sbuf.buf,ind->idx));
+		    ao2_ref(ind, -1);
+      }
+ 	  str_to_hex(hex,armtel_out_ind.sbuf.buf,armtel_out_ind.sbuf.len);
+      ast_verbose("----buf=<%s>\n",hex);
+      ao2_unlock(armtel_out_ind.ind);
+      ao2_iterator_destroy(&i);
+
+    ast_verbose("-----------Armtel input indication\n");
+    ao2_lock(armtel_inp_ind.sw);
+    i=ao2_iterator_init(armtel_inp_ind.sw,0);
+    while((sw=ao2_iterator_next(&i))){
+    	    ast_verbose("----switch=%s\n",sw->nsw->str);
+    	    ind=NULL;
+    	    j=ao2_iterator_init(sw->ind,0);
+    	    while((ind=ao2_iterator_next(&j))){
+    	    	ast_verbose("%s[%d]=%d\n",ind->num->str,ind->idx,armtel_get_state((unsigned char*)sw->sbuf.buf,ind->idx));
+ 		        ao2_ref(ind, -1);
+    	    }
+    	     str_to_hex(hex,sw->sbuf.buf,sw->sbuf.len);
+             ast_verbose("----buf=<%s>\n",hex);
+
+            ao2_ref(sw, -1);
+    }
+    ao2_iterator_destroy(&i);
+
+   ao2_unlock(armtel_inp_ind.sw);
+   ast_verbose("-----------Armtel options\n");
+   ast_verbose("armtel debug=%d\n",armtel_dbg);
+   ast_verbose("armtel protocol=%d\n",armtel_activ);
+   ast_verbose("armtel hint=%s[%d]\n",armtel_hint,armtel_len_hint);
+   ast_verbose("armtel bandwidth=%d\n",armtel_bandwidth);
+   ast_verbose("armtel span=%d\n",armtel_span);
+ //  ast_verbose("armtel resample=%d\n",armtel_resample);
+
+}
+static void check_armtel_indication(unsigned char* sw ,unsigned char* ind,unsigned char len)
+{
+struct indication *in;
+struct armtel_ind *af=NULL;
+int i,j,k;
+
+ao2_lock(armtel_inp_ind.sw);
+
+
+    af= find_in_container_inp_str(armtel_inp_ind.sw,(char*)sw);
+    if((af) && (len >= af->sbuf.len )) {
+//    	ao2_lock(af->ind);
+    	for(i=0 ; i< af->sbuf.len; i++){
+        	for(j=0 ; j< 8; j++){
+        	  if( (af->sbuf.buf[i] & (1<<j)) !=(ind[i] & (1<<j))   ){
+        		  k=i*8 +j;
+        		  if(k< ao2_container_count(af->ind)){
+        		      in = find_in_container_idx(af->ind,k);
+      				  ast_copy_string(&armtel_hint[armtel_len_hint],in->num->str,ARMTEL_HINT_LEN+ARMTEL_NUM_LEN);
+        		      sig_pri_callbacks.armtel_channel_event(armtel_hint,ind[i] & (1<<j));
+        		  }
+        	  }
+        	}
+        	af->sbuf.buf[i]=ind[i];
+    	}
+    	af->timer=0;
+//    	ao2_unlock(af->ind);
+        ao2_ref(af, -1);
+    }
+    else{
+      if(af) ast_log(LOG_WARNING, "Size buf [len=%d][buf=%d ]\n",len ,af->sbuf.len );
+      else ast_log(LOG_WARNING, "Not found switch = %s \n", sw );
+    }
+    ao2_unlock(armtel_inp_ind.sw);
+}
+
+static void send_armtel_indication(struct pri *pri)
+{
+struct indication *ind;
+struct armtel_ind * sw= NULL;
+struct ao2_iterator i;
+int j;
+unsigned char buf[32];
+char hex[128];//,*c;
+
+   ao2_lock(armtel_out_ind.ind);
+      if( asterisk_num != NULL){
+    	    ao2_lock(armtel_inp_ind.sw);
+    	    i=ao2_iterator_init(armtel_inp_ind.sw,0);
+    	    while((sw=ao2_iterator_next(&i))){
+              ind = get_first_obj(sw->ind);
+              if(pri){
+//            	if(armtel_out_ind.buf){
+   	             pri_send_armtel_net_ind(pri,ind->num->str,asterisk_num,armtel_out_ind.sbuf.buf,armtel_out_ind.sbuf.len);
+	             if(armtel_dbg){
+//		          c = ast_str_buffer(armtel_out_ind.buf);
+		          str_to_hex(hex,armtel_out_ind.sbuf.buf,armtel_out_ind.sbuf.len);
+		          ast_verbose("Armtel:<< Num=%s;Ind=%s\n",asterisk_num,hex);
+//	             }
+            	}
+            	else{
+            		if(armtel_dbg) ast_verbose("Armtel:<< don't output indication!\n");
+            	}
+              }
+	          sw->timer++;
+	          if(sw->timer > ARMTEL_TIME_CNT){
+	        	  for(j=0; j<32 ;j++) buf[j]=0xFF;
+	        	  check_armtel_indication((unsigned char*)sw->nsw->str,buf,32);
+	              ast_verbose("Armtel: err timer (switch num=%s[%d])\n",sw->nsw->str,sw->timer);
+	          }
+	          ao2_ref(sw, -1);
+            }
+            ao2_iterator_destroy(&i);
+       	    ao2_unlock(armtel_inp_ind.sw);
+    }
+    ao2_unlock(armtel_out_ind.ind);
+}
+
+
+
+#endif
+
+
 /*!
  * \internal
  * \brief Setup channel variables on the owner.
@@ -5877,6 +6511,7 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 	char plancallingani[AST_MAX_EXTENSION];
 	pthread_t threadid;
 
+
 	if (!ast_strlen_zero(pri->msn_list)
 		&& !sig_pri_msn_match(pri->msn_list, e->ring.callednum)) {
 		/* The call is not for us so ignore it. */
@@ -5922,7 +6557,6 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 			pri_hangup(pri->pri, e->ring.call, PRI_CAUSE_NORMAL_CIRCUIT_CONGESTION);
 			goto setup_exit;
 		}
-
 		callid = func_pri_dchannel_new_callid();
 
 		/* Setup the call interface to use. */
@@ -5987,6 +6621,7 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 		}
 		goto setup_exit;
 	}
+
 
 	sig_pri_lock_private(pri->pvts[chanpos]);
 
@@ -6113,12 +6748,17 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 	case PRI_LAYER_1_ULAW:
 		law = SIG_PRI_ULAW;
 		break;
+#ifdef PRI_ARMTEL_EXT1
+	case PRI_LAYER_1_G722_G725:
+		law = SIG_PRI_ALAWDCN;
+
+		break;
+#endif
 	default:
 		/* This is a data call to us. */
 		law = SIG_PRI_DEFLAW;
 		break;
 	}
-
 	could_match_more = !e->ring.complete
 		&& (pri->overlapdial & DAHDI_OVERLAPDIAL_INCOMING)
 		&& ast_matchmore_extension(NULL, pri->pvts[chanpos]->context,
@@ -6170,6 +6810,29 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 
 	if (c) {
 		setup_incoming_channel(pri, chanpos, e);
+#ifdef PRI_ARMTEL_EXT1
+	struct aics_proxy_params *aipp;
+	int i;
+	aipp = ast_channel_proxy(c);
+	if(aipp !=NULL){
+	    ast_log(LOG_WARNING, "NAME_INP=%s\n",ast_channel_name(c));
+	    aipp->priority=	e->ring.armtel_prio;
+	    aipp->validity.as_bits.priority =1;
+
+		for (i = 0; i < 8; i++) {
+	    	if(e->ring.armtel_relay & (1<<i) ){
+	    		aipp->relay[i].status=1;
+	    	}
+	    }
+	    aipp->validity.as_bits.relay =1;
+
+	    aipp->direction=  armtel_context_to_aisc(e->ring.armtel_context,&(aipp->scenario) );
+	    aipp->validity.as_bits.direction=1;
+	    aipp->validity.as_bits.scenario=1;
+	    ast_log(LOG_WARNING, "stub ARMTEL inp:SETUP prio=%d;context=%d;relay=%d[dir=%d;sce=%d] \n",e->ring.armtel_prio,e->ring.armtel_context,e->ring.armtel_relay,aipp->direction,aipp->scenario);
+
+	}
+#endif
 
 		/* Start PBX */
 		if (could_match_more) {
@@ -6208,6 +6871,7 @@ static void sig_pri_handle_setup(struct sig_pri_span *pri, pri_event *e)
 			}
 		}
 	}
+
 	ast_log(LOG_WARNING, "Unable to start PBX on channel %d/%d, span %d\n",
 		pri->pvts[chanpos]->logicalspan, pri->pvts[chanpos]->prioffset, pri->span);
 	if (c) {
@@ -6251,6 +6915,11 @@ static void *pri_dchannel(void *vpri)
 	int haveidles;
 	int activeidles;
 	unsigned int len;
+#ifdef PRI_ARMTEL_EXT
+	char hex[128];
+	struct timeval net_ind = { 0, 0 };
+	gettimeofday(&net_ind, NULL);
+#endif
 
 	gettimeofday(&lastidle, NULL);
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
@@ -6273,6 +6942,16 @@ static void *pri_dchannel(void *vpri)
 			ast_log(LOG_WARNING, "Idle dial string '%s' lacks '@context'\n", pri->idleext);
 	}
 	for (;;) {
+#ifdef PRI_ARMTEL_EXT
+	if((armtel_activ)&&(armtel_span==pri->span)){
+	 if (ast_tvdiff_ms(ast_tvnow(), net_ind) > 1500) {
+//		ast_log(LOG_WARNING, "send_armtel_indication[span=%d]\n", pri->span);
+		if(  armtel_cfg  ) send_armtel_indication(pri->dchans[which]);
+		gettimeofday(&net_ind, NULL);
+	 }
+	}
+#endif
+
 		struct ast_callid *callid = NULL;
 
 		for (i = 0; i < SIG_PRI_NUM_DCHANS; i++) {
@@ -6463,6 +7142,79 @@ static void *pri_dchannel(void *vpri)
 				pri->pri = pri->dchans[which];
 
 			switch (e->e) {
+#ifdef PRI_ARMTEL_EXT
+			case PRI_EVENT_NET_IND:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+//				 ast_log(LOG_WARNING, "check_armtel_indication[span=%d]\n", pri->span);
+				  check_armtel_indication(e->net_ind.num_switch,e->net_ind.net_ind,e->net_ind.net_ind_len);
+				  if(armtel_dbg){
+				    str_to_hex(hex,(char*)e->net_ind.net_ind,0);
+				    ast_verbose("Armtel:>> Num=%s;Ind=%s \n",e->net_ind.num_switch,hex);
+				  }
+				}
+			break;
+			case PRI_EVENT_ASK_WORD:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->ask_word.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_ASK_WORD,e->ask_word.armtel_prio,e->ask_word.armtel_context);
+				}
+				break;
+			case PRI_EVENT_REMOVE_WORD:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->remove_word.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_REMOVE_WORD,e->remove_word.armtel_prio,e->remove_word.armtel_context);
+				}
+				break;
+			case PRI_EVENT_DIRECTION:
+				 if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->direction.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_DIRECTION,0,e->direction.armtel_context);
+				}
+				break;
+			case PRI_EVENT_INTERRUPT_WORD:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->interrupt_word.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_INTERRUPT_WORD,e->interrupt_word.armtel_prio,e->interrupt_word.armtel_context);
+				}
+				break;
+			case PRI_EVENT_DISKRET3:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->diskret3.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_DISKRET3,0,0);
+				}
+				break;
+			case PRI_EVENT_CHANGE_STATE_CONF:
+				if((armtel_activ)&&(armtel_span==pri->span)){
+					chanpos = pri_find_principle(pri, e->change_state_conf.channel, NULL);
+					if (chanpos < 0) {
+						break;
+					}
+				    struct ast_channel *owner=pri->pvts[chanpos]->owner;
+				    aics_send_armtel_sign(owner,AICS_ARMTEL_CHANGE_STATE_CONF,0,e->change_state_conf.armtel_context);
+				}
+			    break;
+#endif
+
 			case PRI_EVENT_DCHAN_UP:
 				pri->no_d_channels = 0;
 				if (!pri->pri) {
@@ -6487,6 +7239,7 @@ static void *pri_dchannel(void *vpri)
 				sig_pri_span_devstate_changed(pri);
 				break;
 			case PRI_EVENT_DCHAN_DOWN:
+
 				pri_find_dchan(pri);
 				if (!pri_is_up(pri)) {
 					if (pri->sig == SIG_BRI_PTMP) {
@@ -7003,6 +7756,29 @@ static void *pri_dchannel(void *vpri)
 					if (pri->pvts[chanpos]->call_level < SIG_PRI_CALL_LEVEL_CONNECT) {
 						pri->pvts[chanpos]->call_level = SIG_PRI_CALL_LEVEL_CONNECT;
 					}
+
+#ifdef PRI_ARMTEL_EXT1
+			struct ast_format deflaw;
+//			struct aics_proxy_params *aipp;
+//			char buf[5];
+			if(armtel_span==pri->span){
+			  struct ast_channel *ach=pri->pvts[chanpos]->owner;
+			  if(ach){
+	//	ast_log(LOG_WARNING, "PRI_EVENT_ANSWER[layer1=%d;wlaw_chan=%d;rlaw_chan=%d]\n",pri_get_layer1(e->answer.call),ast_channel_rawwriteformat(ach)->id,ast_channel_rawreadformat(ach)->id );
+			   if((ast_channel_rawwriteformat(ach)->id==AST_FORMAT_ALAWDCN )&&(pri_get_layer1(e->answer.call)!=PRI_LAYER_1_G722_G725)){
+				  ast_format_set(&deflaw, AST_FORMAT_ALAW, 0);
+			    }
+			    ast_format_copy( ast_channel_oldwriteformat(ach), &deflaw);
+	//			ast_log(LOG_WARNING, "PRI_EVENT_ANSWER[oldformat=%d]\n",ast_channel_oldwriteformat(ach)->id );
+//				aipp = ast_channel_proxy(ach);
+//				buf=aics_priority_to_str()
+			  }
+			}
+
+//		    ast_log(LOG_WARNING, "stub ARMTEL inp:CONNECT ;context=%d\n",e->answer.armtel_context);
+
+#endif
+
 					sig_pri_open_media(pri->pvts[chanpos]);
 					pri_queue_control(pri, chanpos, AST_CONTROL_ANSWER);
 					sig_pri_set_dialing(pri->pvts[chanpos], 0);
@@ -8018,6 +8794,7 @@ int sig_pri_call(struct sig_pri_chan *p, struct ast_channel *ast, const char *rd
 		pri_rel(p->pri);
 		return -1;
 	}
+
 	if (!(sr = pri_sr_new())) {
 		ast_log(LOG_WARNING, "Failed to allocate setup request on channel %d\n",
 			p->channel);
@@ -8048,8 +8825,53 @@ int sig_pri_call(struct sig_pri_chan *p, struct ast_channel *ast, const char *rd
 		pri_sr_set_channel(sr, PVT_TO_CHANNEL(p), exclusive, 1);
 	}
 
-	pri_sr_set_bearer(sr, p->digital ? PRI_TRANS_CAP_DIGITAL : ast_channel_transfercapability(ast),
-		(p->digital ? -1 : layer1));
+#ifdef PRI_ARMTEL_EXT1
+//	ast_log(LOG_WARNING, "armtel_bandwidth[chan=%d;span= %d]\n",p->channel,p->pri->span);
+	struct aics_proxy_params *aipp;
+//	const char*  buf;
+	unsigned char i,relay=0;
+
+	if((armtel_bandwidth) && (armtel_span == p->pri->span)&& (armtel_activ)){
+	   pri_sr_set_bearer(sr, PRI_LAYER_1_G722_G725,0x25);
+	}
+	else{
+	   pri_sr_set_bearer(sr, p->digital ? PRI_TRANS_CAP_DIGITAL : ast_channel_transfercapability(ast),
+		 (p->digital ? -1 : layer1));
+	}
+	if((armtel_span == p->pri->span)&& (armtel_activ)){
+	 aipp = ast_channel_proxy(ast);
+	 if(aipp !=NULL){
+//	  ast_log(LOG_WARNING, "NAME=%s\n",ast_channel_name(ast));
+	  if(aipp->validity.as_bits.relay){
+		 ast_log(LOG_WARNING, "relay is validity\n",ast_channel_name(ast));
+		for (i = 0; i < 8; i++) {
+	    	if (aipp->relay[i].status){
+	    		relay |= (1<<i);
+	    	}
+	    }
+	  }
+	  unsigned char cntx= armtel_context_from_aisc(aipp->direction,aipp->scenario);
+	  ast_log(LOG_NOTICE, "%s AICS:New call prio=%d;dir=%d;scen=%d;relay=%X[context=%d ]\n",ast_channel_name(ast),aipp->priority,aipp->direction,aipp->scenario,relay,cntx);
+	  pri_set_armtel_new_call (p->pri->pri, p->call,cntx,aipp->priority,relay);
+	 }
+	 else{
+	     ast_log(LOG_WARNING, "aipp=NULL !!!\n");
+	     pri_set_armtel_new_call (p->pri->pri, p->call,0,0,0);
+	 }
+	}
+
+/*
+	if (p->owner) {
+		aipp = ast_channel_proxy(p->owner);
+		 ast_log(LOG_WARNING, "NAME OWNER=%s\n",ast_channel_name(p->owner));
+		ast_log(LOG_WARNING, "owner prio=%d\n",aipp->priority);
+	}
+*/
+//    pri_set_armtel_new_call (p->pri->pri, p->call,0,prio,0x55);
+//    pri_set_armtel_new_call (p->pri->pri, p->call,0,aipp->priority,0x55);
+//    ast_log(LOG_WARNING, "stub ARMTEL out:SETUP prio=%d;context=0;relay=0x55\n",prio);
+
+#endif
 
 	if (p->pri->facilityenable)
 		pri_facility_enable(p->pri->pri);
@@ -8666,6 +9488,15 @@ int sig_pri_answer(struct sig_pri_chan *p, struct ast_channel *ast)
 	}
 	sig_pri_set_dialing(p, 0);
 	sig_pri_open_media(p);
+#ifdef PRI_ARMTEL_EXT
+	if((armtel_span == p->pri->span)&& (armtel_activ)){
+		struct aics_proxy_params *aipp = ast_channel_proxy(ast);
+	    unsigned char cntx= armtel_context_from_aisc(aipp->direction,aipp->scenario);
+	//    cntx=1;
+        ast_log(LOG_WARNING, "stub ARMTEL out:CONNECT ;context=%d;\n",cntx);
+	    res = pri_set_armtel_answer(p->pri->pri, p->call, cntx);
+	}
+#endif
 	res = pri_answer(p->pri->pri, p->call, 0, !p->digital);
 	pri_rel(p->pri);
 	ast_setstate(ast, AST_STATE_UP);

@@ -29,6 +29,11 @@
 #ifndef _ASTERISK_CHAN_DAHDI_H
 #define _ASTERISK_CHAN_DAHDI_H
 
+
+#ifndef AST_MODULE
+#define AST_MODULE "chan_dahdi"
+#endif
+
 #if defined(HAVE_OPENR2)
 #include <openr2.h>
 #endif	/* defined(HAVE_OPENR2) */
@@ -43,6 +48,10 @@
 #if defined(__cplusplus) || defined(c_plusplus)
 extern "C" {
 #endif
+
+
+#define RAST_LOG
+//#define DAHDI_ARMTEL
 
 /* ------------------------------------------------------------------- */
 

@@ -29,6 +29,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413588 $")
 
@@ -556,6 +557,23 @@ static int func_channel_read(struct ast_channel *chan, const char *function,
 			}
 		}
 		ast_channel_unlock(chan);
+	} else if (!strncasecmp(data, "armtel_", 7)) {
+		ast_channel_lock(chan);
+		struct aics_proxy_params *aproxy = ast_channel_proxy(chan);
+		if (!strcasecmp(data, "armtel_priority")) {
+			snprintf(buf, len, "%s", aics_priority_get(aproxy));
+		} else if (!strcasecmp(data, "armtel_direction")) {
+			snprintf(buf, len, "%s", aics_direction_get(aproxy));
+		} else if (!strcasecmp(data, "armtel_scenario")) {
+			snprintf(buf, len, "%s", aics_scenario_get(aproxy));
+		} else if (!strcasecmp(data, "armtel_playlist")) {
+			snprintf(buf, len, "%s", aics_playlist_get(aproxy));
+		} else if (!strcasecmp(data, "armtel_relay")) {
+			snprintf(buf, len, "%s", aics_relay_get(aproxy));
+		} else if (!strcasecmp(data, "armtel_event")) {
+			snprintf(buf, len, "%s", aics_event_get(aproxy));
+		}
+		ast_channel_unlock(chan);
 	} else if (!ast_channel_tech(chan) || !ast_channel_tech(chan)->func_channel_read || ast_channel_tech(chan)->func_channel_read(chan, function, data, buf, len)) {
 		ast_log(LOG_WARNING, "Unknown or unavailable item requested: '%s'\n", data);
 		ret = -1;
@@ -714,6 +732,26 @@ static int func_channel_write_real(struct ast_channel *chan, const char *functio
 			store->signaling = ast_true(value) ? 1 : 0;
 		} else if (!strcasecmp(data, "secure_bridge_media")) {
 			store->media = ast_true(value) ? 1 : 0;
+		}
+		ast_channel_unlock(chan);
+	} else if (!strncasecmp(data, "armtel_", 7)) {
+		if (!chan || !value) {
+			return -1;
+		}
+		ast_channel_lock(chan);
+		struct aics_proxy_params *aproxy = ast_channel_proxy(chan);
+		if (!strcasecmp(data, "armtel_priority")) {
+			aics_priority_set(aproxy, value);
+		} else if (!strcasecmp(data, "armtel_direction")) {
+			aics_direction_set(aproxy, value);
+		} else if (!strcasecmp(data, "armtel_scenario")) {
+			aics_scenario_set(aproxy, value);
+		} else if (!strcasecmp(data, "armtel_playlist")) {
+			aics_playlist_set(aproxy, value);
+		} else if (!strcasecmp(data, "armtel_relay")) {
+			aics_relay_set(aproxy, value);
+		} else if (!strcasecmp(data, "armtel_event")) {
+			aics_event_set(aproxy, value);
 		}
 		ast_channel_unlock(chan);
 	} else if (!ast_channel_tech(chan)->func_channel_write

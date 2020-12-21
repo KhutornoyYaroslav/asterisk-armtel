@@ -220,6 +220,7 @@
 */
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 429316 $")
 
@@ -642,6 +643,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 429316 $")
 	</managerEvent>
  ***/
 
+
+
 static int min_expiry = DEFAULT_MIN_EXPIRY;        /*!< Minimum accepted registration time */
 static int max_expiry = DEFAULT_MAX_EXPIRY;        /*!< Maximum accepted registration time */
 static int default_expiry = DEFAULT_DEFAULT_EXPIRY;
@@ -701,7 +704,8 @@ static const struct cfsubscription_types {
 	{ CPIM_PIDF_XML,   "presence", "application/cpim-pidf+xml",   "cpim-pidf+xml" },  /* RFC 3863 */
 	{ PIDF_XML,        "presence", "application/pidf+xml",        "pidf+xml" },       /* RFC 3863 */
 	{ XPIDF_XML,       "presence", "application/xpidf+xml",       "xpidf+xml" },       /* Pre-RFC 3863 with MS additions */
-	{ MWI_NOTIFICATION,	"message-summary", "application/simple-message-summary", "mwi" } /* RFC 3842: Mailbox notification */
+	{ MWI_NOTIFICATION,	"message-summary", "application/simple-message-summary", "mwi" }, /* RFC 3842: Mailbox notification */
+	{ AIDF_XML, 		"armtel", 	"application/aidf+xml",        "aidf+xml"} /* AICS Armtel event package */
 };
 
 /*! \brief The core structure to setup dialogs. We parse incoming messages by using
@@ -819,6 +823,12 @@ static unsigned int global_cos_video;    /*!< 802.1p class of service for video 
 static unsigned int global_cos_text;     /*!< 802.1p class of service for text RTP packets */
 static unsigned int recordhistory;       /*!< Record SIP history. Off by default */
 static unsigned int dumphistory;         /*!< Dump history to verbose before destroying SIP dialog */
+
+static char global_callpriority[AST_MAX_EXTENSION];   /* AICS support for sip.conf callpriority field */
+static char global_priorityhandle[AST_MAX_EXTENSION];   /* AICS support for sip.conf priorityhandle field */
+static char global_hangupanounce[AST_MAX_EXTENSION]; /*  AICS support for sip.conf hangupanounce field */
+static char global_ipn20UA[AST_MAX_EXTENSION];  	  /* AICS support for sip.conf IPN2.0 devices */
+
 static char global_useragent[AST_MAX_EXTENSION];    /*!< Useragent for the SIP channel */
 static char global_sdpsession[AST_MAX_EXTENSION];   /*!< SDP session name for the SIP channel */
 static char global_sdpowner[AST_MAX_EXTENSION];     /*!< SDP owner name for the SIP channel */
@@ -1023,6 +1033,93 @@ static struct ao2_container *dialogs;
 #define sip_pvt_trylock(x) ao2_trylock(x)
 #define sip_pvt_unlock(x) ao2_unlock(x)
 
+/* AICS armtel event package support */
+//#define AE_MOCK_BODY "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n \
+//<armtel entity=\"\" xmlns=\"urn:ietf:params:xml:ns:aidf\">\r\n \
+//<status>offline</status>\r\n \
+//<lines>\r\n \
+//<line1>0</line1>\r\n \
+//<line2>0</line2>\r\n \
+//<line3>0</line3>\r\n \
+//<line4>0</line4>\r\n \
+//<line5>0</line5>\r\n \
+//<line6>0/line6>\r\n \
+//<line7>0</line7>\r\n \
+//<line8>0</line8>\r\n \
+//</lines>\r\n \
+//<events>\r\n \
+//<event1>0</event1>\r\n \
+//<event2>0</event2>\r\n \
+//<event3>0</event3>\r\n \
+//<event4>0</event4>\r\n \
+//<event5>0</event5>\r\n \
+//<event6>0/event6>\r\n \
+//<event7>0</event7>\r\n \
+//<event8>0</event8>\r\n \
+//</events>\r\n \
+//</armtel>\r\n"
+
+//#define AE_MOCK_BODY "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n \
+//<armtelevent xmlns=\"urn:ietf:params:xml:ns:aidf\">\r\n \
+//<status>\r\n \
+//<lines>\r\n \
+//<line1>unavailable</line1>\r\n \
+//<line2>unavailable</line2>\r\n \
+//<line3>unavailable</line3>\r\n \
+//<line4>unavailable</line4>\r\n \
+//<line5>unavailable</line5>\r\n \
+//<line6>unavailable</line6>\r\n \
+//<line7>unavailable</line7>\r\n \
+//<line8>unavailable</line8>\r\n \
+//</lines>\r\n \
+//</status>\r\n \
+//</armtelevent>\r\n"
+
+/* armtel event body */
+struct ae_body {
+	struct ast_str *data;
+	struct timeval time_updated;
+};
+
+/* armtel event subscriber/provider id */
+//struct ae_id {
+//	char name[80];
+//	char callid[255];
+//};
+
+enum AE_MATCH_RESULT {
+	AE_MATCH_NONE,
+	AE_MATCH_NAME,
+	//AE_MATCH_CALLID,
+	AE_MATCH_FULL,
+};
+
+/* armtel event subscriber list chunk */
+struct ae_subscriber {
+	char name[80];
+	char callid[255];
+	struct timeval time_updated;
+//	struct ae_id id;
+	AST_LIST_ENTRY(ae_subscriber) next;
+};
+
+/* armtel event provider */
+struct ae_provider {
+	struct ae_provider *next;
+	char name[80];
+	char callid[255];
+	char uri[255];
+	struct timeval time_updated;
+//	struct ae_id id;
+	AST_LIST_HEAD_NOLOCK(, ae_subscriber) subscribers;
+	struct ae_body body;
+};
+
+/* armtel event subscriptions */
+static struct ao2_container *ae_providers;
+
+/* ~AICS */
+
 /*! \brief  The table of TCP threads */
 static struct ao2_container *threadt;
 
@@ -1200,6 +1297,18 @@ static int transmit_info_with_aoc(struct sip_pvt *p, struct ast_aoc_decoded *dec
 static int transmit_info_with_digit(struct sip_pvt *p, const char digit, unsigned int duration);
 static int transmit_info_with_vidupdate(struct sip_pvt *p);
 static int transmit_message(struct sip_pvt *p, int init, int auth);
+/* AICS */
+
+static int get_armtel_sign(char* sign,unsigned char *cmd,unsigned char *context,unsigned char *prio );
+static int transmit_message_armtel_sign(struct sip_pvt *p,const char* to,unsigned char cmd, unsigned char context);
+//static int is_sip_member(const char* to,const char* up);
+static int is_notify_outgoing_ind(struct sip_pvt *p,const char* to,const char* up,int state);
+static int check_member_armtel_group(struct ast_bridge_channel *bc,const char* exten,const char* tech );
+static struct ast_exten* armtel_find_ext(struct sip_request *req, char* context , char* exten,char* tech,char* cid_num,char*ext_full);
+static int is_armtel_group(struct sip_pvt *p,struct sip_request *req,struct ast_sockaddr *addr);
+struct ast_exten* find_ext_dial( char* context , char* exten,char* cid_num);
+/* AICS */
+
 static int transmit_refer(struct sip_pvt *p, const char *dest);
 static int transmit_notify_with_mwi(struct sip_pvt *p, int newmsgs, int oldmsgs, const char *vmexten);
 static int transmit_notify_with_sipfrag(struct sip_pvt *p, int cseq, char *message, int terminate);
@@ -1211,6 +1320,7 @@ static void copy_request(struct sip_request *dst, const struct sip_request *src)
 static void receive_message(struct sip_pvt *p, struct sip_request *req, struct ast_sockaddr *addr, const char *e);
 static void parse_moved_contact(struct sip_pvt *p, struct sip_request *req, char **name, char **number, int set_call_forward);
 static int sip_send_mwi_to_peer(struct sip_peer *peer, int cache_only);
+//static int sip_send_armtel_to_peer(struct sip_peer *peer);
 
 /* Misc dialog routines */
 static int __sip_autodestruct(const void *data);
@@ -1227,6 +1337,10 @@ static enum check_auth_result register_verify(struct sip_pvt *p, struct ast_sock
 					      struct sip_request *req, const char *uri);
 static int get_sip_pvt_from_replaces(const char *callid, const char *totag, const char *fromtag,
 		struct sip_pvt **out_pvt, struct ast_channel **out_chan);
+//static int find_same_dialstr_priority(struct sip_pvt *p, char **foundpriority);
+//struct ast_channel *find_same_peername_priority(struct sip_pvt *p, int *foundpriority);
+struct ast_channel *get_same_peername_channel(struct sip_pvt *p, struct aics_local_params **params);//struct aics_pvt_addons **pvt_addons);
+
 static void check_pendings(struct sip_pvt *p);
 static void sip_set_owner(struct sip_pvt *p, struct ast_channel *chan);
 
@@ -1342,6 +1456,7 @@ static char *sip_qualify_peer(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 static char *sip_show_registry(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *sip_unregister(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *sip_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
+static char *sip_show_armtel(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static char *sip_show_mwi(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a);
 static const char *subscription_type2str(enum subscriptiontype subtype) attribute_pure;
 static const struct cfsubscription_types *find_subscription_type(enum subscriptiontype subtype);
@@ -1447,6 +1562,7 @@ static void update_redirecting(struct sip_pvt *p, const void *data, size_t datal
 static int get_domain(const char *str, char *domain, int len);
 static void get_realm(struct sip_pvt *p, const struct sip_request *req);
 static char *get_content(struct sip_request *req);
+static char *get_content_crlf(struct sip_request *req);
 
 /*-- TCP connection handling ---*/
 static void *_sip_tcp_helper_thread(struct ast_tcptls_session_instance *tcptls_session);
@@ -1609,6 +1725,224 @@ static struct ast_cc_agent_callbacks sip_cc_agent_callbacks = {
    Below starts actual code
    ------------------------
 */
+
+/* AICS armtel event package support */
+static void armtel_provider_discard(const char* name);
+/* Destroy armtel event provider structure */
+struct ae_provider *ae_destroy(struct ae_provider *p)
+{
+	ast_debug(1, "Destroying armtel event provider %s\n", p->name);
+	ast_log(LOG_NOTICE, "Destroying armtel event provider %s\n", p->name);
+	ao2_t_unlink(ae_providers, p, "unlink armtel event provider from providers table");
+
+	/* Clear body */
+	if (p->body.data) {
+		ast_free(p->body.data);
+		p->body.data = NULL;
+	}
+
+	/* Clear subscribers */
+	if (!AST_LIST_EMPTY(&p->subscribers)) {
+		struct ae_subscriber *sub;
+		while ( (sub = AST_LIST_REMOVE_HEAD(&p->subscribers, next)) ) {
+			ast_free(sub);
+		}
+//		ast_free(p->subscribers);
+//		p->subscribers = NULL;
+	}
+
+	return NULL;
+}
+
+static void ae_destroy_fn(void *p)
+{
+	ae_destroy(p);
+}
+
+static int ae_hash_cb(const void *obj, const int flags)
+{
+	const struct ae_provider *p = obj;
+
+	return ast_str_case_hash(p->name);
+}
+
+static int ae_cmp_cb(void *obj, void *arg, int flags)
+{
+	struct ae_provider *p = obj, *p2 = arg;
+
+	return !strcasecmp(p->name, p2->name) ? CMP_MATCH | CMP_STOP : 0;
+}
+
+static void ae_update_provider_callid(struct ae_provider *p, const char *callid)
+{
+	if (!p)
+		return;
+
+	if (callid) {
+		ast_copy_string(p->callid, callid, sizeof(p->callid));
+	} else {
+		p->callid[0] = '\0';
+	}
+	p->time_updated = ast_tvnow();
+}
+
+static void ae_update_provider_uri(struct ae_provider *p, const char *uri)
+{
+	if (!p)
+		return;
+
+	if (uri) {
+		ast_copy_string(p->uri, uri, sizeof(p->uri));
+	} else {
+		p->uri[0] = '\0';
+	}
+	//p->time_updated = ast_tvnow();
+}
+
+static void ae_update_provider_body(struct ae_provider *p, const char* data)
+{
+	if (!p || !data)
+		return;
+
+	if (!p->body.data) {
+		p->body.data = ast_str_create(strlen(data)+2);
+	} else {
+		ast_str_reset(p->body.data);
+	}
+	ast_str_append(&p->body.data, 0, "%s\r\n", data);//ast_str_copy_string(&p->body.data, data);
+	p->body.time_updated = ast_tvnow();
+}
+
+static void ae_update_subscriber_callid(struct ae_subscriber *s, const char *callid)
+{
+	if (!s)
+		return;
+
+	if (callid) {
+		ast_copy_string(s->callid, callid, sizeof(s->callid));
+	} else {
+		s->callid[0] = '\0';
+	}
+	s->time_updated = ast_tvnow();
+}
+static const char* ae_build_body(const char* uri)
+{
+	static char unsafe_buffer[255];
+	int shift = 0;
+	unsafe_buffer[0] = '\0';
+
+	shift += snprintf(&unsafe_buffer[shift], sizeof(unsafe_buffer) - shift, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n");
+	shift += snprintf(&unsafe_buffer[shift], sizeof(unsafe_buffer) - shift, "<armtel entity=\"%s\" xmlns=\"urn:ietf:params:xml:ns:aidf\">\r\n", uri);
+	shift += snprintf(&unsafe_buffer[shift], sizeof(unsafe_buffer) - shift, "<status>offline</status>\r\n");
+	shift += snprintf(&unsafe_buffer[shift], sizeof(unsafe_buffer) - shift, "</armtel>\r\n");
+
+	return unsafe_buffer;
+}
+
+/* Allocate ae_provider structure, set defaults and link in the container */
+static struct ae_provider *ae_alloc(const char* name, const char *callid, const char *uri)//struct ast_str* data)
+{
+	struct ae_provider *p;
+
+	ast_log(LOG_NOTICE, "ae_alloc armtel event provider %s\n", name);
+	if (!name)
+		return NULL;
+
+	if (!(p = ao2_t_alloc(sizeof(*p), ae_destroy_fn, "allocate armtel event provider")))
+		return NULL;
+
+	ast_copy_string(p->name, name, sizeof(p->name));
+	ae_update_provider_callid(p, callid);
+	ae_update_provider_uri(p, uri);
+	ae_update_provider_body(p, ae_build_body(uri));
+//	if (callid)
+//		ast_copy_string(p->callid, callid, sizeof(p->callid));
+//	if (data) {
+//		p->body.data = ast_str_create(strlen(data)+2);
+//		ast_str_append(&p->body.data, 0, "%s\r\n", data);//ast_str_copy_string(&p->body.data, data);
+//	}
+	AST_LIST_HEAD_INIT_NOLOCK(&p->subscribers);
+
+	/* Add to provider list */
+
+	ao2_t_link(ae_providers, p, "link armtel event provider into providers table");
+
+	ast_debug(1, "Allocating new armtel event provider for %s (%s)\n", name, callid ? callid : "null");
+	return p;
+}
+
+/* Add subscriber to provider */
+static int ae_add_subscriber(struct ae_provider *p, const char* name, const char *callid)
+{
+	if (!p || !name || !callid)
+		return FALSE;
+
+//	struct ae_subscriber sub;// = { 0,	};
+//	ast_log(LOG_NOTICE, "ae_add subscriber %s (%s) to %s\n", name, callid, p->name);
+//	ast_copy_string(sub.name, name, sizeof(sub.name));
+//	ast_copy_string(sub.callid, callid, sizeof(sub.callid));
+//	AST_LIST_INSERT_TAIL(&p->subscribers, &sub, next);
+
+	struct ae_subscriber *sub = ast_calloc(1, sizeof(struct ae_subscriber));
+	if (!sub)
+		return FALSE;
+	ast_log(LOG_NOTICE, "ae_add subscriber %s (%s) to %s\n", name, callid, p->name);
+	ast_copy_string(sub->name, name, sizeof(sub->name));
+	//ast_copy_string(sub->callid, callid, sizeof(sub->callid));
+	ae_update_subscriber_callid(sub, callid);
+	AST_LIST_INSERT_TAIL(&p->subscribers, sub, next);
+	return TRUE;
+}
+
+/* Find subscriber */
+static enum AE_MATCH_RESULT ae_find_subscriber(struct ae_provider *p, const char* name, const char *callid, struct ae_subscriber **subscriber)
+{
+	struct ae_subscriber* sub = NULL;
+
+	if (p && name) {
+		ast_log(LOG_NOTICE, "Searching for subscriber %s in provider %s\n", name, p->name);
+		AST_LIST_TRAVERSE(&p->subscribers, sub, next) {
+			if (sub && !strcasecmp(sub->name, name)) {
+				if (subscriber)
+					*subscriber = sub;
+				if (callid && !strcasecmp(sub->callid, callid))
+					return AE_MATCH_FULL;
+				return AE_MATCH_NAME;
+			}
+		}
+	}
+	return AE_MATCH_NONE;
+}
+
+/* Find provider */
+static enum AE_MATCH_RESULT ae_find_provider(const char* name, const char *callid, struct ae_provider **provider)
+{
+	struct ae_provider *provider_ptr;
+	struct ae_provider tmp_provider;
+
+	ast_copy_string(tmp_provider.name, name, sizeof(tmp_provider.name));
+
+	ast_log(LOG_NOTICE, "Searching for %s\n", tmp_provider.name);
+
+	provider_ptr = ao2_t_find(ae_providers, &tmp_provider, OBJ_KEY, "ao2_find in ae_providers");
+	if (provider)
+		*provider = provider_ptr;
+	if (!provider_ptr)
+		return AE_MATCH_NONE;
+	if (callid && !strcasecmp(provider_ptr->callid, callid))
+		return AE_MATCH_FULL;
+	return AE_MATCH_NAME;
+}
+
+int ast_devstate_changed_stub(enum ast_device_state state, enum ast_devstate_cache cachable, const char *fmt, const char *name)
+{
+	/* discard provider */
+	if (state == AST_DEVICE_UNKNOWN) {
+		armtel_provider_discard(name);
+	}
+	return ast_devstate_changed(state, cachable, fmt, name);
+}
+/* ~AICS */
 
 static int sip_epa_register(const struct epa_static_data *static_data)
 {
@@ -5126,6 +5460,126 @@ static void clear_peer_mailboxes(struct sip_peer *peer)
 		destroy_mailbox(mailbox);
 }
 
+///*! Destroy armtel subscriptions */
+//static void destroy_armtel_subscriber(struct sip_armtel_subs *sub)
+//{
+////	if (mailbox->event_sub) {
+////		mailbox->event_sub = stasis_unsubscribe(mailbox->event_sub);
+////	}
+//	ast_free(sub);
+//}
+///* AICS debug */
+//static void log_peer_armtel_sub(struct sip_peer *peer)
+//{
+//	struct sip_armtel_subs *sub;
+//	ast_log(LOG_NOTICE, "Peer %s type %s\n", peer->name, armtelsubtypestr[peer->armtel_event.armtel_type]);
+//	AST_LIST_TRAVERSE_SAFE_BEGIN(&peer->armtel_event.armtel_subs, sub, nextsub) {
+//		ast_log(LOG_NOTICE, "    sub name %s cid %s\n", sub->name, sub->callid);
+//	}
+//	AST_LIST_TRAVERSE_SAFE_END;
+//	ast_log(LOG_NOTICE, "Body [%s]\n", (peer->armtel_event.armtel_body?peer->armtel_event.armtel_body:"null"));
+//}
+///* AICS add armtel event sub to peer */
+//static int add_peer_armtel_subscriber(struct sip_peer *peer, const char *name, const char *id)
+//{
+//	char *subid = ast_strdupa(id);
+//	char *subname = ast_strdupa(name);
+//	struct sip_armtel_subs *sub;
+//	int duplicate = 0;
+//	int res = 0;
+//
+//	ast_log(LOG_NOTICE, "Adding sub %s(%s) to peer %s\n", subname, subid, peer->name);
+//	log_peer_armtel_sub(peer);
+//	/* remove leading/trailing whitespace from callid string */
+//	subid = ast_strip(subid);
+//	if (ast_strlen_zero(subid)) {
+//		res--;
+//	}
+//	subname = ast_strip(subname);
+//	if (ast_strlen_zero(subname)) {
+//		res--;
+//	}
+//	if (res < 0)
+//		return res;
+//	/* Check whether the sub is already in the list */
+//	AST_LIST_TRAVERSE_SAFE_BEGIN(&peer->armtel_event.armtel_subs, sub, nextsub) {
+//		if (!strcmp(sub->name, subname)) {
+//			duplicate++;
+//			if (!strcmp(sub->callid, subid)) {
+//				duplicate++;
+//				struct sip_pvt *sip_pvt_ptr;
+//				struct sip_pvt tmp_dialog = {
+//					.callid = sub->callid,
+//				};
+//				sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+//				if (sip_pvt_ptr) {
+//					ast_log(LOG_NOTICE, "Really duplicate!\n");
+//					res = -20;
+//				} else {
+//					//AST_LIST_LOCK(&peer->armtel_event.armtel_subs);
+//					AST_LIST_REMOVE_CURRENT(nextsub);
+//					destroy_armtel_subscriber(sub);
+//					//AST_LIST_UNLOCK(&peer->armtel_event.armtel_subs);
+//					ast_log(LOG_NOTICE, "Duplicate, but no longer exists!\n");
+//					res = -5;
+//				}
+//				break;
+//			}
+//			break;
+//		}
+//	}
+//	AST_LIST_TRAVERSE_SAFE_END;
+//	ast_log(LOG_NOTICE, "dup %d\n", duplicate);
+//	switch(duplicate) {
+//	case 2: {
+//
+//	} break;
+//	case 0: {
+//		ast_log(LOG_NOTICE, "Really new!\n");
+//		sub = ast_calloc(1, sizeof(*sub) );
+//		if (!sub) {
+//			res = -10;
+//			break;
+//		}
+//		strcpy(sub->name, subname); /* SAFE */
+//		strcpy(sub->callid, subid); /* SAFE */
+//		AST_LIST_INSERT_TAIL(&peer->armtel_event.armtel_subs, sub, nextsub);
+//	} break;
+//	case 1: {
+//		struct sip_pvt *sip_pvt_ptr;
+//		struct sip_pvt tmp_dialog = {
+//			.callid = sub->callid,
+//		};
+//		sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+//		if (sip_pvt_ptr) {
+//			ast_log(LOG_NOTICE, "Marking old pvt %s to be destroyed!\n",sip_pvt_ptr->callid);
+//			pvt_set_needdestroy(sip_pvt_ptr, "refresh subscription");
+//		}
+//		strcpy(sub->callid, subid); /* SAFE */
+//	} break;
+//	}
+//	log_peer_armtel_sub(peer);
+//	return res;
+//}
+///* clear armtel body */
+//static void clear_peer_armtel_body(struct sip_peer *peer)
+//{
+//	if (peer->armtel_event.armtel_body) {
+//			ast_free(peer->armtel_event.armtel_body);
+//			peer->armtel_event.armtel_body = NULL;
+//	}
+//}
+///*! Destroy all peer-related armtel subscriptions */
+//static void clear_peer_armtel_event(struct sip_peer *peer)
+//{
+//	struct sip_armtel_subs *sub;
+//
+//	while ((sub = AST_LIST_REMOVE_HEAD(&peer->armtel_event.armtel_subs, nextsub)))
+//		destroy_armtel_subscriber(sub);
+//	ast_str_reset(peer->armtel_event.armtel_body);	//clear_peer_armtel_body(peer);
+//	peer->armtel_event.armtel_type = AE_UNSET;
+//}
+
 static void sip_destroy_peer_fn(void *peer)
 {
 	sip_destroy_peer(peer);
@@ -5142,6 +5596,8 @@ static void sip_destroy_peer(struct sip_peer *peer)
 	 * happening right now.
 	 */
 	clear_peer_mailboxes(peer);
+//	clear_peer_armtel_event(peer);
+//	clear_peer_armtel_body(peer);
 
 	if (peer->outboundproxy) {
 		ao2_ref(peer->outboundproxy, -1);
@@ -5158,6 +5614,11 @@ static void sip_destroy_peer(struct sip_peer *peer)
 		dialog_unlink_all(peer->mwipvt);
 		peer->mwipvt = dialog_unref(peer->mwipvt, "unreffing peer->mwipvt");
 	}
+
+//	if (peer->armtelpvt) {	/* We have an active armtel event subscription, delete it */
+//		dialog_unlink_all(peer->armtelpvt);
+//		peer->armtelpvt = dialog_unref(peer->armtelpvt, "unreffing peer->armtelpvt");
+//	}
 
 	if (peer->chanvars) {
 		ast_variables_destroy(peer->chanvars);
@@ -5960,7 +6421,7 @@ static int create_addr_from_peer(struct sip_pvt *dialog, struct sip_peer *peer)
 	if (dialog_initialize_rtp(dialog)) {
 		return -1;
 	}
-
+	dialog->aics_local.spy = peer->spy;
 	if (dialog->rtp) { /* Audio */
 		ast_rtp_instance_set_prop(dialog->rtp, AST_RTP_PROPERTY_DTMF, ast_test_flag(&dialog->flags[0], SIP_DTMF) == SIP_DTMF_RFC2833);
 		ast_rtp_instance_set_prop(dialog->rtp, AST_RTP_PROPERTY_DTMF_COMPENSATE, ast_test_flag(&dialog->flags[1], SIP_PAGE2_RFC2833_COMPENSATE));
@@ -6039,6 +6500,7 @@ static int create_addr_from_peer(struct sip_pvt *dialog, struct sip_peer *peer)
 			}
 		}
 	}
+//ast_log(LOG_NOTICE, "fromuser is %s\n", peer->fromuser);
 	if (!ast_strlen_zero(peer->fromuser)) {
 		ast_string_field_set(dialog, fromuser, peer->fromuser);
 	}
@@ -6236,6 +6698,7 @@ static int sip_call(struct ast_channel *ast, const char *dest, int timeout)
 	int cc_core_id;
 	char uri[SIPBUFSIZE] = "";
 
+//ast_log(LOG_NOTICE, "AICS C:%p P: %p\n", ast, p);
 	if ((ast_channel_state(ast) != AST_STATE_DOWN) && (ast_channel_state(ast) != AST_STATE_RESERVED)) {
 		ast_log(LOG_WARNING, "sip_call called on %s, neither down nor reserved\n", ast_channel_name(ast));
 		return -1;
@@ -6623,7 +7086,8 @@ void __sip_destroy(struct sip_pvt *p, int lockowner, int lockdialoglist)
 		ao2_ref(p->last_device_state_info, -1);
 		p->last_device_state_info = NULL;
 	}
-
+	aics_proxy_params_free(&p->aics_proxy);
+	aics_local_params_free(&p->aics_local);
 	/* Lastly, kill the callid associated with the pvt */
 	if (p->logger_callid) {
 		ast_callid_unref(p->logger_callid);
@@ -6791,6 +7255,43 @@ static void sip_destroy_fn(void *p)
 {
 	sip_destroy(p);
 }
+#ifdef SIP_ARMTEL_QUEUE
+static struct ast_channel *sip_new(struct sip_pvt *i, int state, const char *title, const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, struct ast_callid *callid);
+static char mailid[128];
+//------------------------------------------------------------------
+// При отбое абонента проверяется наличие очереди сообщений если есть
+// вызывается приложение для проигрывания этих сообщений 
+//-----------------------------------------------------------------
+void check_armtel_queue(const char *num)
+{
+    struct sip_peer *user;
+    if ((user = sip_find_peer(num, NULL, TRUE, FINDUSERS, FALSE, 0))) {
+			struct sip_pvt *p =sip_alloc(NULL, NULL, 1, SIP_INVITE, NULL, NULL/*logger_callid*/);
+     //       ast_log(LOG_NOTICE, "peer name= %s;\n", user->name);
+			if(p){
+				ast_string_field_set(p, exten, user->armtel_queue);
+				ast_string_field_set(p, cid_num, user->armtel_queue);
+				ast_string_field_set(p, context, "ArmtelQUE");
+				sip_pvt_lock(p);
+				struct ast_channel *c = sip_new(p, AST_STATE_UP, num, NULL, NULL, p->logger_callid);				
+				sip_pvt_unlock(p);
+				ast_channel_unlock(c);
+				if(c){
+	                ast_log(LOG_NOTICE, "ast_pbx_start\n");
+					if (ast_pbx_start(c)) {
+			            ast_channel_hangupcause_set(c, AST_CAUSE_SWITCH_CONGESTION);
+			            ast_hangup(c);
+			            c = NULL;
+	                    ast_log(LOG_ERROR, "ast_pbx_start error\n");
+	                }
+				}
+		        else ast_log(LOG_ERROR, "err chan\n");
+			
+			}
+			else ast_log(LOG_ERROR, "err pvt\n");
+	}
+}
+#endif
 
 /*! \brief Destroy SIP call structure.
  * Make it return NULL so the caller can do things like
@@ -6800,8 +7301,34 @@ static void sip_destroy_fn(void *p)
 struct sip_pvt *sip_destroy(struct sip_pvt *p)
 {
 	ast_debug(3, "Destroying SIP dialog %s\n", p->callid);
+#ifdef SIP_ARMTEL_QUEUE	
+	char num[32];
+//	int method =p->method;
+	struct sip_peer *user;
+	int is_aque=FALSE;
+//	ast_log(LOG_ERROR, "Destroying SIP dialog [%s][%s][%s]\n", p->exten,p->peername,p->context );
+	strcpy(num,p->peername);
+    if ((user = sip_find_peer(num, NULL, TRUE, FINDUSERS, FALSE, 0))) {
+	  if( (!ast_strlen_zero(user->armtel_queue)) &&
+	      (strcasecmp(user->armtel_queue,p->exten)!= 0) && 
+		  (p->method== SIP_INVITE) ) //Если отбилось наше приложение очередь проверять не надо
+	         is_aque=TRUE;
+	}
+//	if((strcasecmp("502",p->exten)==0) && (strcasecmp("507",p->peername)==0)) {
+	if(!is_aque){
+#endif	 
+	 __sip_destroy(p, TRUE, TRUE);
+	  return NULL;
+#ifdef SIP_ARMTEL_QUEUE	
+	}
+	else{
 	__sip_destroy(p, TRUE, TRUE);
-	return NULL;
+//  	  if((method== SIP_INVITE)&&(strcmp(num,"507") ==0 )){
+		    strcpy(mailid,num);
+//	  }
+	 return NULL;
+	}
+#endif	
 }
 
 /*! \brief Convert SIP hangup causes to Asterisk hangup causes */
@@ -6999,6 +7526,8 @@ static int sip_hangup(struct ast_channel *ast)
 	int needcancel = FALSE;
 	int needdestroy = 0;
 	struct ast_channel *oldowner = ast;
+
+    armtel_hangup(ast);
 
 	if (!p) {
 		ast_debug(1, "Asked to hangup channel that was not connected\n");
@@ -7260,6 +7789,7 @@ static int sip_answer(struct ast_channel *ast)
 				ast_channel_name(ast));
 		return res;
 	}
+	//ast_log(LOG_NOTICE, "AICS P: %p\n", p);
 	sip_pvt_lock(p);
 	if (ast_channel_state(ast) != AST_STATE_UP) {
 		try_suggested_sip_codec(p);
@@ -7288,7 +7818,6 @@ static int sip_write(struct ast_channel *ast, struct ast_frame *frame)
 {
 	struct sip_pvt *p = ast_channel_tech_pvt(ast);
 	int res = 0;
-
 	switch (frame->frametype) {
 	case AST_FRAME_VOICE:
 		if (!(ast_format_cap_iscompatible(ast_channel_nativeformats(ast), &frame->subclass.format))) {
@@ -7704,6 +8233,8 @@ static int sip_indicate(struct ast_channel *ast, int condition, const void *data
 {
 	struct sip_pvt *p = ast_channel_tech_pvt(ast);
 	int res = 0;
+//	struct aics_proxy_params *abc ;
+	struct aics_sig_armtel *sig;
 
 	if (!p) {
 		ast_debug(1, "Asked to indicate condition on channel %s with no pvt; ignoring\n",
@@ -7713,6 +8244,37 @@ static int sip_indicate(struct ast_channel *ast, int condition, const void *data
 
 	sip_pvt_lock(p);
 	switch(condition) {
+	/* AICS addons support */
+	case AST_CONTROL_ARMTEL_INTERCOM_SIG:
+		if(data){
+			 sig =(struct aics_sig_armtel*)data;
+			 if(strlen(sig->number)==0) aics_num_from_name(sig->number,ast_channel_name(ast));
+
+             ast_log(LOG_NOTICE, "%s AICS:signaling ARMTEL cmd=%s context=%d;prio=%d\n",ast_channel_name(ast),aics_get_name_cmd(sig->cmd),sig->context,sig->prio);
+		  switch(sig->cmd){
+		  case AICS_ARMTEL_ASK_WORD:
+		      transmit_message_armtel_sign(p,sig->number, sig->cmd, sig->context);
+//			  ast_log(LOG_WARNING, "(%s)ASK_WORD context=%d;prio=%d \n",ast_channel_name(ast),sig->context,sig->prio);
+			  break;
+		  case AICS_ARMTEL_REMOVE_WORD:
+		      transmit_message_armtel_sign(p,sig->number,sig->cmd, sig->context);
+//			  ast_log(LOG_WARNING, "(%s)REMOVE_WORD context=%d;prio=%d \n",ast_channel_name(ast),sig->context,sig->prio);
+			  break;
+		  case AICS_ARMTEL_INTERRUPT_WORD:
+			  break;
+		  case AICS_ARMTEL_DIRECTION:
+		      transmit_message_armtel_sign(p,sig->number,sig->cmd, sig->context);
+//			  ast_log(LOG_WARNING, "(%s)DIRECTION context=%d \n",ast_channel_name(ast),sig->context);
+			  break;
+		  case AICS_ARMTEL_DISKRET3:
+			  break;
+		  case AICS_ARMTEL_CHANGE_STATE_CONF:
+			  break;
+
+		  }
+		}
+		break;
+        /* ~ASIC */
 	case AST_CONTROL_RINGING:
 		if (ast_channel_state(ast) == AST_STATE_RING) {
 			p->invitestate = INV_EARLY_MEDIA;
@@ -7947,6 +8509,31 @@ static struct ast_channel *sip_new(struct sip_pvt *i, int state, const char *tit
 
 	ast_channel_stage_snapshot(tmp);
 
+	/* AICS addons support */
+	struct aics_proxy_params *dstparams = ast_channel_proxy(tmp);
+	struct aics_proxy_params *srcparams = ast_channel_proxy(requestor);
+	////aics_addons_notice(srcaddons, "sip_new 0 tmp");
+	////aics_addons_notice(dstaddons, "sip_new 0 req");
+	if (requestor) {
+		//ast_log(LOG_NOTICE, "aics_proxy_params_copy(dstparams, srcparams);\n");
+		aics_proxy_params_copy(dstparams, srcparams);
+		////srcaddons->ctrlchan = ast_strdup(ast_channel_name(requestor));
+		//ast_log(LOG_NOTICE, "aics_proxy_params_copy(&i->aics_proxy, srcparam\n");
+		aics_proxy_params_copy(&i->aics_proxy, srcparams);
+		//aics_addons_notice(ast_channel_addons(tmp), "sip_new tmp");
+//		dstparams->is_member=1;
+
+	} else {
+		////srcaddons->platform = ast_strdup(i->useragent);
+		//ast_log(LOG_NOTICE, "aics_proxy_params_copy(dstparams, &i->aics_proxy);\n");
+		aics_proxy_params_copy(dstparams, &i->aics_proxy);
+//		tmpstr = sip_get_header(&i->initreq, H_PRIORITY);
+//		addons->callpriority = aics_priority_str2int(tmpstr);
+//		ast_channel_addons_set(tmp, srcaddons);
+		//aics_addons_notice(ast_channel_addons(tmp), "sip_new tmp");
+	}
+	/* ~AICS */
+
 	/* If we sent in a callid, bind it to the channel. */
 	if (callid) {
 		ast_channel_callid_set(tmp, callid);
@@ -8066,6 +8653,28 @@ static struct ast_channel *sip_new(struct sip_pvt *i, int state, const char *tit
 	if (!ast_strlen_zero(i->parkinglot)) {
 		ast_channel_parkinglot_set(tmp, i->parkinglot);
 	}
+
+//	/* AICS support for SIP 'Priority:' header */
+//	const char *tempstr = i->callpriority;
+//	if (requestor) {
+//		//ast_log(LOG_NOTICE, "Requestor found, priority pvt was '%s'\n", tempstr);
+//		tempstr = ast_channel_callpriority(requestor);
+//		ast_string_field_set(i, callpriority, tempstr);
+//	}
+//	ast_channel_callpriority_set(tmp, tempstr);
+//	//ast_log(LOG_NOTICE, "Priority to channel '%s'\n", tempstr);
+//
+//	/* AICS support for SDP 'a=sendonly' atribute */
+//	tempstr = i->ipn20_sdp_a;
+//	if (requestor) {
+//		//ast_log(LOG_NOTICE, "Requestor found, SDP 'a' pvt was '%s'\n", tempstr);
+//		tempstr = ast_channel_ipn20_sdp_a(requestor);
+//		ast_string_field_set(i, ipn20_sdp_a, tempstr);
+//	}
+//	ast_channel_ipn20_sdp_a_set(tmp, tempstr);
+//	//ast_log(LOG_NOTICE, "SDP 'a' to channel '%s'\n", tempstr);
+//	/* ~AICS */
+
 	if (!ast_strlen_zero(i->accountcode)) {
 		ast_channel_accountcode_set(tmp, i->accountcode);
 	}
@@ -8092,6 +8701,7 @@ static struct ast_channel *sip_new(struct sip_pvt *i, int state, const char *tit
 	exten = ast_strdupa(i->exten);
 	sip_pvt_unlock(i);
 	ast_channel_unlock(tmp);
+
 	if (!ast_exists_extension(NULL, i->context, i->exten, 1, i->cid_num)) {
 		ast_uri_decode(exten, ast_uri_sip_user);
 	}
@@ -8338,6 +8948,27 @@ static char *get_content(struct sip_request *req)
 	return ast_str_buffer(str);
 }
 
+/*! \brief Get message body content with \r\n */
+static char *get_content_crlf(struct sip_request *req)
+{
+	struct ast_str *str;
+	int i;
+
+	if (!(str = ast_str_thread_get(&sip_content_buf, 128))) {
+		return NULL;
+	}
+
+	ast_str_reset(str);
+
+	for (i = 0; i < req->lines; i++) {
+		if (ast_str_append(&str, 0, "%s\r\n", REQ_OFFSET_TO_STR(req, line[i])) < 0) {
+			return NULL;
+		}
+	}
+
+	return ast_str_buffer(str);
+}
+
 /*! \brief Read RTP from network */
 static struct ast_frame *sip_rtp_read(struct ast_channel *ast, struct sip_pvt *p, int *faxdetect)
 {
@@ -8439,17 +9070,47 @@ static struct ast_frame *sip_rtp_read(struct ast_channel *ast, struct sip_pvt *p
 
 	return f;
 }
-
+//struct ast_frame armtel_control_frame;
 /*! \brief Read SIP RTP from channel */
 static struct ast_frame *sip_read(struct ast_channel *ast)
 {
 	struct ast_frame *fr;
 	struct sip_pvt *p = ast_channel_tech_pvt(ast);
 	int faxdetected = FALSE;
+//	struct aics_sig_armtel out;
 
 	sip_pvt_lock(p);
-	fr = sip_rtp_read(ast, p, &faxdetected);
+	/* AICS addons support */
+// отправка сигнализации армтел в ядро
+	  struct aics_proxy_params *lp;
+	  lp=ast_channel_proxy(ast);
+	  if(lp){
+//		 if(( lp->sig_armtel.cmd == AICS_ARMTEL_ASK_WORD) || ( lp->sig_armtel.cmd == AICS_ARMTEL_REMOVE_WORD)|| ( lp->sig_armtel.cmd == AICS_ARMTEL_DIRECTION))
+	     if(( lp->sig_armtel.cmd != AICS_CMD_NONE) &&(lp->sig_armtel.send==0))
+		 {
+			   fr= ast_channel_dtmff(ast);
+			   if(fr){
+				  ast_log(LOG_NOTICE, "%s AICS:signaling ARMTEL cmd=%s context=%d;prio=%d\n",ast_channel_name(ast),aics_get_name_cmd(lp->sig_armtel.cmd),lp->sig_armtel.context,lp->sig_armtel.prio);
+			      fr->frametype = AST_FRAME_CONTROL;
+			      fr->subclass.integer = AST_CONTROL_ARMTEL_SIG;
+                  fr->data.ptr =&lp->sig_armtel;
+                  fr->datalen =sizeof(struct aics_sig_armtel);
+				  lp->sig_armtel.send=1;
+			      sip_pvt_unlock(p);
+			      return fr;
+			   }
+		 }
+	     if(lp->sig_armtel.send){
+			  ast_log(LOG_WARNING, "Not send sig ARMTEL(%s) cmd=%d \n",ast_channel_name(ast),lp->sig_armtel.cmd);
+			  lp->sig_armtel.cmd = AICS_CMD_NONE;
+			  lp->sig_armtel.send=0;
+	     }
+
+	  }
+	  /* ~AICS */
+	fr = sip_rtp_read(ast,p,&faxdetected);
 	p->lastrtprx = time(NULL);
+
 
 	/* If we detect a CNG tone and fax detection is enabled then send us off to the fax extension */
 	if (faxdetected && ast_test_flag(&p->flags[1], SIP_PAGE2_FAX_DETECT_CNG)) {
@@ -8681,6 +9342,8 @@ struct sip_pvt *sip_alloc(ast_string_field callid, struct ast_sockaddr *addr,
 		return NULL;
 	}
 
+	aics_proxy_params_init(&p->aics_proxy);
+	aics_local_params_init(&p->aics_local);
 
 	/* If this dialog is created as a result of a request or response, lets store
 	 * some information about it in the dialog. */
@@ -8754,6 +9417,7 @@ struct sip_pvt *sip_alloc(ast_string_field callid, struct ast_sockaddr *addr,
 	p->ocseq = INITIAL_CSEQ;
 	p->allowed_methods = UINT_MAX;
 
+	p->aics_local.spy = FALSE;
 	if (sip_methods[intended_method].need_rtp) {
 		p->maxcallbitrate = default_maxcallbitrate;
 		p->autoframing = global_autoframing;
@@ -9929,12 +10593,13 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 	int red_num_gen = 0;		/* For T.140 RED */
 	char red_fmtp[100] = "empty";	/* For T.140 RED */
 	int debug = sip_debug_test_pvt(p);
+	//char formatbuf[SIPBUFSIZE/2];
 
 	/* START UNKNOWN */
 	char buf[SIPBUFSIZE];
 	struct ast_format tmp_fmt;
 	/* END UNKNOWN */
-
+//ast_log(LOG_NOTICE, "p '%p' name '%s' meth '%s'\n", p, p->peername, sip_methods[p->method].text);
 	/* Initial check */
 	if (!p->rtp) {
 		ast_log(LOG_ERROR, "Got SDP but have no RTP session allocated.\n");
@@ -9943,12 +10608,14 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 	}
 	if (!peercapability || !vpeercapability || !tpeercapability || !newpeercapability || !newjointcapability) {
 		res = -1;
+//ast_log(LOG_NOTICE, "(!peercapability || !vpeercapability || !tpeercapability || !newpeercapability || !newjointcapability)\n");
 		goto process_sdp_cleanup;
 	}
 
 	if (ast_rtp_codecs_payloads_initialize(&newaudiortp) || ast_rtp_codecs_payloads_initialize(&newvideortp) ||
 	    ast_rtp_codecs_payloads_initialize(&newtextrtp)) {
 		res = -1;
+//ast_log(LOG_NOTICE, "(ast_rtp_codecs_payloads_initialize(&newaudiortp) || ast_rtp_codecs_payloads_initialize(&newvideortp) || ast_rtp_codecs_payloads_initialize(&newtextrtp))\n");
 		goto process_sdp_cleanup;
 	}
 
@@ -9975,6 +10642,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 			 */
 			if (!process_sdp_o(value, p)) {
 				res = (p->session_modify == FALSE) ? 0 : -1;
+//ast_log(LOG_NOTICE, "(!process_sdp_o(value, p))\n");
 				goto process_sdp_cleanup;
 			}
 			processed = TRUE;
@@ -9990,6 +10658,9 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 			break;
 		case 'a':
 			if (process_sdp_a_sendonly(value, &sendonly)) {
+				/* AICS support for SDP 'a=sendonly' atribute */
+				//ast_log(LOG_NOTICE, "SDP (%p) processed 1 '%s' method '%s' UA '%s' owner '%s'\n", p, (value ? value : "NULL"), sip_methods[p->method].text, p->useragent, (p->owner ? ast_getformatname_multiple(formatbuf, sizeof(formatbuf), ast_channel_nativeformats(p->owner)) : "NULL"));
+				/* ~AICS */
 				processed = TRUE;
 			}
 			else if (process_sdp_a_audio(value, p, &newaudiortp, &last_rtpmap_codec))
@@ -10441,6 +11112,15 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 							ast_set_flag(p->srtp, AST_SRTP_CRYPTO_OFFER_OK);
 						}
 					} else if (process_sdp_a_sendonly(value, &sendonly)) {
+//						/* AICS support for SDP 'a=sendonly' atribute */
+//						//ast_log(LOG_NOTICE, "SDP (%p) processed 2 '%s' method '%s' UA '%s' owner '%s'\n", p, (value ? value : "NULL"), sip_methods[p->method].text, p->useragent, (p->owner ? ast_getformatname_multiple(formatbuf, sizeof(formatbuf), ast_channel_nativeformats(p->owner)) : "NULL"));
+//						if (!strcasecmp(p->useragent, global_ipn20UA)) {
+////							ast_string_field_set(p, ipn20_sdp_a, value);
+//							aics_pvt_addons_set_direction(&p->aics_addons, aics_direction_str2int(value));//p->aics_addons.direction = aics_direction_str2int(value);
+//							ast_log(LOG_NOTICE, "AICS Incoming SDP '%s'\n", value);
+//							sendonly = -1;
+//						}
+//						/* ~AICS */
 						processed = TRUE;
 					} else if (!processed_crypto && process_crypto(p, p->rtp, &p->srtp, value)) {
 						processed_crypto = TRUE;
@@ -10757,6 +11437,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 	if ((portno == -1) && (p->t38.state != T38_DISABLED) && (p->t38.state != T38_REJECTED)) {
 		ast_debug(3, "Have T.38 but no audio, accepting offer anyway\n");
 		res = 0;
+//ast_log(LOG_NOTICE, "Have T.38 but no audio, accepting offer anyway\n");
 		goto process_sdp_cleanup;
 	}
 
@@ -10765,6 +11446,7 @@ static int process_sdp(struct sip_pvt *p, struct sip_request *req, int t38action
 
 	if (!p->owner) { /* There's no open channel owning us so we can return here. For a re-invite or so, we proceed */
 		res = 0;
+//ast_log(LOG_NOTICE, "(!p->owner)\n");
 		goto process_sdp_cleanup;
 	}
 
@@ -10946,6 +11628,12 @@ static int process_sdp_a_sendonly(const char *a, int *sendonly)
 			*sendonly = 0;
 		found = TRUE;
 	}
+//	/* AICS Support for UPDATE method */
+//	else if (!strcasecmp(a, "recvonly")) {
+//		*sendonly = -1;
+//		found = TRUE;
+//	}
+//	/* ~AICS */
 	return found;
 }
 
@@ -11407,6 +12095,13 @@ static int add_header(struct sip_request *req, const char *var, const char *valu
 	req->headers++;
 
 	return 0;
+}
+
+static int add_header_with_value(struct sip_request *req, const char *var, const char *value)
+{
+	if (value)
+		return add_header(req, var, value);
+	return -1;
 }
 
 /*!
@@ -11897,6 +12592,7 @@ static int reqprep(struct sip_request *req, struct sip_pvt *p, int sipmethod, ui
 	char stripped[80];
 	char tmp[80];
 	char newto[256];
+	char fromtag[128];
 	const char *c;
 	const char *ot, *of;
 	int is_strict = FALSE;		/*!< Strict routing flag */
@@ -11904,6 +12600,7 @@ static int reqprep(struct sip_request *req, struct sip_pvt *p, int sipmethod, ui
 
 	snprintf(p->lastmsg, sizeof(p->lastmsg), "Tx: %s", sip_methods[sipmethod].text);
 
+//ast_log(LOG_NOTICE, "Tx %s seqno %d ocseq %d icseq %d pu %d\n", sip_methods[sipmethod].text, seqno, p->ocseq, p->icseq, p->aics_local.pendingupdate);
 	if (!seqno) {
 		p->ocseq++;
 		seqno = p->ocseq;
@@ -11979,12 +12676,20 @@ static int reqprep(struct sip_request *req, struct sip_pvt *p, int sipmethod, ui
 
 	ot = sip_get_header(orig, "To");
 	of = sip_get_header(orig, "From");
+	gettag(orig, "From", fromtag, sizeof(fromtag));
+	//ast_log(LOG_NOTICE, "from '%s' to '%s' tag '%s' theirtag '%s'\n", of, ot, p->tag, p->theirtag);
 
 	/* Add tag *unless* this is a CANCEL, in which case we need to send it exactly
 	   as our original request, including tag (or presumably lack thereof) */
 	if (!strcasestr(ot, "tag=") && sipmethod != SIP_CANCEL) {
 		/* Add the proper tag if we don't have it already.  If they have specified
 		   their tag, use it.  Otherwise, use our own tag */
+
+//		/* AICS support for UPDATE method */
+//		if(!is_outbound && !strcasecmp(p->useragent, global_ipn20UA) && !strcasecmp(p->tag, fromtag))
+//			is_outbound = (p->aics_local.pendingupdate > 0);//(sipmethod == SIP_BYE);
+//		/* ~AICS */
+
 		if (is_outbound && !ast_strlen_zero(p->theirtag))
 			snprintf(newto, sizeof(newto), "%s;tag=%s", ot, p->theirtag);
 		else if (!is_outbound)
@@ -11994,10 +12699,16 @@ static int reqprep(struct sip_request *req, struct sip_pvt *p, int sipmethod, ui
 		ot = newto;
 	}
 
+	if ((is_outbound) && (p->aics_local.pendingupdate > 0) && (sipmethod == SIP_BYE)) {
+		is_outbound = 0;
+	}
+
 	if (is_outbound) {
+		//ast_log(LOG_NOTICE, "Out From [%s] To [%s]\n", of,ot);
 		add_header(req, "From", of);
 		add_header(req, "To", ot);
 	} else {
+		//ast_log(LOG_NOTICE, "In From [%s] To [%s]\n", ot,of);
 		add_header(req, "From", ot);
 		add_header(req, "To", of);
 	}
@@ -12008,6 +12719,44 @@ static int reqprep(struct sip_request *req, struct sip_pvt *p, int sipmethod, ui
 	copy_header(req, orig, "Call-ID");
 	add_header(req, "CSeq", tmp);
 
+	/* AICS header extensions */
+	if ((sipmethod == SIP_INVITE) || (sipmethod == SIP_UPDATE) || (sipmethod == SIP_MESSAGE)) {
+		// always proxy relay, direction
+		add_header_with_value(req, H_ARMTEL_RELAY, aics_relay_get(&p->aics_proxy));
+		add_header_with_value(req, H_ARMTEL_DIRECTION, aics_direction_get(&p->aics_proxy));
+		add_header_with_value(req, H_ARMTEL_SCENARIO, aics_scenario_get(&p->aics_proxy));
+		// proxy priority and sceanrio only for INVITE
+		if (sipmethod != SIP_MESSAGE) {
+			add_header_with_value(req, H_PRIORITY, aics_priority_get(&p->aics_proxy));
+
+		}
+		// do not proxy event and playlist - it's server stuff
+		//add_header_with_value(req, H_ARMTEL_PLAYLIST, aics_playlist_get(&p->aics_proxy));
+		//add_header_with_value(req, H_ARMTEL_EVENT, aics_event_get(&p->aics_proxy));
+	}
+
+//
+//		add_header(req, H_PRIORITY, aics_priority_to_str(p->aics_proxy.priority));
+//		add_header(req, H_ARMTEL_DIRECTION, aics_direction_to_str(p->aics_proxy.direction));
+//		add_header(req, H_ARMTEL_SCENARIO, aics_scenario_to_str(p->aics_proxy.scenario));
+//		//add_header(req, H_ARMTEL_PLAYLIST, aics_playlist_to_str(&p->aics_proxy.playlist));
+//		add_header(req, H_ARMTEL_RELAY, aics_relay_to_str(&p->aics_proxy.relay[0], sizeof(p->aics_proxy.relay)/sizeof(p->aics_proxy.relay[0])));
+//		add_header(req, H_ARMTEL_EVENT, aics_event_to_str(&p->aics_proxy.event[0], sizeof(p->aics_proxy.event)/sizeof(p->aics_proxy.event[0])));
+
+//	aics_addons_notice(ast_channel_addons(p->owner));
+//	if (p->owner && !ast_strlen_zero(ast_channel_ggs_scenario(p->owner)) && !ast_strlen_zero(global_ipn20UA)) {
+//		ast_log(LOG_NOTICE, "Tx: %s Ua: '%s' formed '%s' own: %p\n", sip_methods[sipmethod].text, p->useragent, global_ipn20UA, p->owner);
+//		add_header(req, "User-Agent", global_ipn20UA);
+//		ast_string_field_set(p, useragent, global_ipn20UA);
+//	} else if (!ast_strlen_zero(global_useragent)) {
+//		//ast_log(LOG_NOTICE, "Tx: %s Ua: '%s' formed '%s' own: %p\n", sip_methods[sipmethod].text, p->useragent, global_useragent, p->owner);
+//		add_header(req, "User-Agent", global_useragent);
+//	}
+//	if (p->owner && !ast_strlen_zero(ast_channel_ggs_scenario(p->owner)) && !ast_strlen_zero(global_ipn20UA)) {
+//		add_header(req, "User-Agent", global_ipn20UA);
+//	} else if (!ast_strlen_zero(global_useragent)) {
+//		add_header(req, "User-Agent", global_useragent);
+//	}
 	if (!ast_strlen_zero(global_useragent))
 		add_header(req, "User-Agent", global_useragent);
 
@@ -13102,6 +13851,7 @@ static enum sip_result add_sdp(struct sip_request *resp, struct sip_pvt *p, int 
 	char *session_time = "t=0 0\r\n"; 			/* Time the session is active */
 	char bandwidth[256] = "";			/* Max bitrate */
 	char *hold = "";
+	char temphold[256];
 	struct ast_str *m_audio = ast_str_alloca(256);  /* Media declaration line for audio */
 	struct ast_str *m_video = ast_str_alloca(256);  /* Media declaration line for video */
 	struct ast_str *m_text = ast_str_alloca(256);   /* Media declaration line for text */
@@ -13198,15 +13948,55 @@ static enum sip_result add_sdp(struct sip_request *resp, struct sip_pvt *p, int 
 		 ast_sockaddr_stringify_addr_remote(&dest));
 
 	if (add_audio) {
-		if (ast_test_flag(&p->flags[1], SIP_PAGE2_CALL_ONHOLD) == SIP_PAGE2_CALL_ONHOLD_ONEDIR) {
-			hold = "a=recvonly\r\n";
-			doing_directmedia = FALSE;
-		} else if (ast_test_flag(&p->flags[1], SIP_PAGE2_CALL_ONHOLD) == SIP_PAGE2_CALL_ONHOLD_INACTIVE) {
-			hold = "a=inactive\r\n";
-			doing_directmedia = FALSE;
-		} else {
-			hold = "a=sendrecv\r\n";
-		}
+
+//		/* AICS support for SDP 'a=sendonly' atribute */
+//		/* AICS support for UPDATE method */
+//
+//		if (p->aics_addons.direction > AICS_DIRECTION_SENDRECV) {//if (!ast_strlen_zero(p->ipn20_sdp_a)) {
+//			strcpy(temphold, "a=");
+//			//ast_log(LOG_NOTICE, "p '%p' c '%p' Outgoing %s Rmethod %s Pmethod %s\n", p, p->owner, AST_YESNO(ast_test_flag(&p->flags[0], SIP_OUTGOING)), sip_methods[resp->method].text, sip_methods[p->method].text);
+//			//if (!strcasecmp(p->useragent, global_ipn20UA) && !ast_test_flag(&p->flags[0], SIP_OUTGOING) && !p->pendingupdate) {
+//			if (!strcasecmp(p->useragent, global_ipn20UA) && (resp->method == SIP_RESPONSE)) {
+//				switch (p->aics_addons.direction) {
+//				case AICS_DIRECTION_SENDONLY:
+//					strcat(temphold, aics_direction_type[AICS_DIRECTION_RECVONLY]);
+//					break;
+//				case AICS_DIRECTION_RECVONLY:
+//					strcat(temphold, aics_direction_type[AICS_DIRECTION_SENDONLY]);
+//					break;
+//				default:
+//					strcat(temphold, aics_direction_type[p->aics_addons.direction]);
+//				}
+//
+////				if (!strcasecmp(p->ipn20_sdp_a, "sendonly")) {
+////					strcat(temphold, "recvonly");
+////					ast_log(LOG_NOTICE, "AICS Replaced 'sendonly' with 'recvonly'\n");
+////				} else if (!strcasecmp(p->ipn20_sdp_a, "recvonly")) {
+////					strcat(temphold, "sendonly");
+////					ast_log(LOG_NOTICE, "AICS Replaced 'recvonly' with 'sendonly'\n");
+////				} else if (strcasecmp(p->ipn20_sdp_a, "sendrecv")) {
+////					strcat(temphold, "sendrecv");
+////					ast_log(LOG_NOTICE, "AICS Replaced '%s' with 'sendrecv'\n", p->ipn20_sdp_a);
+////				}
+//			}
+//			if (strlen(temphold) < 3)
+//				strcat(temphold, aics_direction_type[p->aics_addons.direction]);
+//			ast_log(LOG_NOTICE, "AICS Outgoing SDP '%s' PMeth %s\n", temphold, sip_methods[p->method].text);
+//		} else {
+			if (ast_test_flag(&p->flags[1], SIP_PAGE2_CALL_ONHOLD) == SIP_PAGE2_CALL_ONHOLD_ONEDIR) {
+				strcpy(temphold, "a=recvonly");
+				doing_directmedia = FALSE;
+			} else if (ast_test_flag(&p->flags[1], SIP_PAGE2_CALL_ONHOLD) == SIP_PAGE2_CALL_ONHOLD_INACTIVE) {
+				strcpy(temphold, "a=inactive");
+				doing_directmedia = FALSE;
+			} else {
+				strcpy(temphold, "a=sendrecv");
+			}
+//		}
+		//char formatbuf[SIPBUFSIZE/2];
+		//ast_log(LOG_NOTICE, "SDP (%p) added '%s' method '%s' UA '%s' owner '%s'\n", p, temphold , sip_methods[p->method].text, p->useragent, (p->owner ? ast_getformatname_multiple(formatbuf, sizeof(formatbuf), ast_channel_nativeformats(p->owner)) : "NULL"));
+		hold = strcat(temphold, "\r\n");
+//		/* ~AICS */
 
 		ast_format_cap_copy(tmpcap, p->jointcaps);
 
@@ -13664,6 +14454,7 @@ static int transmit_response_with_sdp(struct sip_pvt *p, const char *msg, const 
 {
 	struct sip_request resp;
 	uint32_t seqno;
+//ast_log(LOG_NOTICE, "AICS P: %p\n", p);
 	if (sscanf(sip_get_header(req, "CSeq"), "%30u ", &seqno) != 1) {
 		ast_log(LOG_WARNING, "Unable to get seqno from '%s'\n", sip_get_header(req, "CSeq"));
 		return -1;
@@ -13754,7 +14545,7 @@ static int determine_firstline_parts(struct sip_request *req)
 static int transmit_reinvite_with_sdp(struct sip_pvt *p, int t38version, int oldsdp)
 {
 	struct sip_request req;
-
+//ast_log(LOG_NOTICE, "AICS P: %p\n", p);
 	reqprep(&req, p, ast_test_flag(&p->flags[0], SIP_REINVITE_UPDATE) ?  SIP_UPDATE : SIP_INVITE, 0, 1);
 
 	add_header(&req, "Allow", ALLOWED_METHODS);
@@ -13776,11 +14567,31 @@ static int transmit_reinvite_with_sdp(struct sip_pvt *p, int t38version, int old
 	offered_media_list_destroy(p);
 
 	try_suggested_sip_codec(p);
+
+//		/* AICS ugly workaround !!! */
+//		int swapped = FALSE;
+//		if (p->aics_addons.direction == AICS_DIRECTION_SENDONLY) {
+//			p->aics_addons.direction = AICS_DIRECTION_RECVONLY;
+//			swapped = TRUE;
+//		} else if (p->aics_addons.direction == AICS_DIRECTION_RECVONLY) {
+//			p->aics_addons.direction = AICS_DIRECTION_SENDONLY;
+//			swapped = TRUE;
+//		}
+
 	if (t38version) {
 		add_sdp(&req, p, oldsdp, FALSE, TRUE);
 	} else {
 		add_sdp(&req, p, oldsdp, TRUE, FALSE);
 	}
+
+//		if (swapped) {
+//			if (p->aics_addons.direction == AICS_DIRECTION_SENDONLY) {
+//				p->aics_addons.direction = AICS_DIRECTION_RECVONLY;
+//			} else if (p->aics_addons.direction == AICS_DIRECTION_RECVONLY) {
+//				p->aics_addons.direction = AICS_DIRECTION_SENDONLY;
+//			}
+//		}
+//		/* ~AICS ugly workaround !!! */
 
 	/* Use this as the basis */
 	initialize_initreq(p, &req);
@@ -13819,6 +14630,8 @@ static void extract_uri(struct sip_pvt *p, struct sip_request *req)
 	}
 
 }
+
+
 
 /*! \brief Build contact header - the contact header we send out */
 static void build_contact(struct sip_pvt *p)
@@ -13917,6 +14730,7 @@ static void initreqprep(struct sip_request *req, struct sip_pvt *p, int sipmetho
 	}
 
 	/* Allow user to be overridden */
+//ast_log(LOG_NOTICE, "fromuser is %s l %s\n", p->fromuser, l);
 	if (!ast_strlen_zero(p->fromuser))
 		l = p->fromuser;
 	else /* Save for any further attempts */
@@ -14032,9 +14846,49 @@ static void initreqprep(struct sip_request *req, struct sip_pvt *p, int sipmetho
 	add_header(req, "Contact", p->our_contact);
 	add_header(req, "Call-ID", p->callid);
 	add_header(req, "CSeq", tmp_n);
-	if (!ast_strlen_zero(global_useragent)) {
+
+	/* AICS header extensions */
+	if ((sipmethod == SIP_INVITE) || (sipmethod == SIP_UPDATE) || (sipmethod == SIP_MESSAGE)) {
+		// always proxy relay, direction
+		add_header_with_value(req, H_ARMTEL_RELAY, aics_relay_get(&p->aics_proxy));
+		add_header_with_value(req, H_ARMTEL_DIRECTION, aics_direction_get(&p->aics_proxy));
+		add_header_with_value(req, H_ARMTEL_SCENARIO, aics_scenario_get(&p->aics_proxy));
+		// proxy priority and sceanrio only for INVITE
+		if (sipmethod != SIP_MESSAGE) {
+			add_header_with_value(req, H_PRIORITY, aics_priority_get(&p->aics_proxy));
+
+		}
+		// do not proxy event and playlist - it's server stuff
+		//add_header_with_value(req, H_ARMTEL_PLAYLIST, aics_playlist_get(&p->aics_proxy));
+		//add_header_with_value(req, H_ARMTEL_EVENT, aics_event_get(&p->aics_proxy));
+	}
+
+//	aics_addons_notice(ast_channel_addons(p->owner));
+//	if (p->owner && !ast_strlen_zero(ast_channel_ggs_scenario(p->owner)) && !ast_strlen_zero(global_ipn20UA)) {
+//		ast_log(LOG_NOTICE, "Tx: %s Ua: '%s' formed '%s' own: %p\n", sip_methods[sipmethod].text, p->useragent, global_ipn20UA, p->owner);
+//
+//		add_header(req, "User-Agent", global_ipn20UA);
+//		ast_string_field_set(p, useragent, global_ipn20UA);
+//	} else
+		if (!ast_strlen_zero(global_useragent)) {
+
+		//ast_log(LOG_NOTICE, "Tx: %s Ua: '%s' formed '%s' own: %p\n", sip_methods[sipmethod].text, p->useragent, global_useragent, p->owner);
 		add_header(req, "User-Agent", global_useragent);
 	}
+//	/* AICS support for SIP 'Priority:' header */
+//	if (sipmethod == SIP_INVITE) {
+//		char priostr[80];
+//		aics_priority_int2str(p->aics_addons.callpriority, priostr);
+////const char *priostr = p->callpriority;
+////		if (ast_strlen_zero(priostr))
+////			priostr = global_callpriority;
+//		add_header(req, H_PRIORITY, priostr);
+//		ast_log(LOG_NOTICE, "AICS Outgoing Request Priority '%s'\n", priostr);
+//
+//	}
+//	/* ~AICS */
+
+
 }
 
 /*! \brief Add "Diversion" header to outgoing message
@@ -14183,7 +15037,11 @@ static int transmit_invite(struct sip_pvt *p, int sipmethod, int sdp, int init, 
 		} else if (p->subscribed == CALL_COMPLETION) {
 			add_header(&req, "Event", "call-completion");
 			add_header(&req, "Accept", "application/call-completion");
+		} else if (p->subscribed == AIDF_XML) {
+			add_header(&req, "Event", "armtel");
+			add_header(&req, "Accept", "application/aidf+xml");
 		}
+
 		add_expires(&req, p->expiry);
 	}
 
@@ -14799,6 +15657,11 @@ static int transmit_cc_notify(struct ast_cc_agent *agent, struct sip_pvt *subscr
 /*! \brief Used in the SUBSCRIBE notification subsystem (RFC3265) */
 static int transmit_state_notify(struct sip_pvt *p, struct state_notify_data *data, int full, int timeout)
 {
+
+//ast_log(LOG_WARNING, "--Notfy(%s) username=%s;extern=%s;useragent=%s;\n",sip_methods[p->method].text,p->username,p->exten,p->useragent);
+
+
+
 	struct ast_str *tmp = ast_str_alloca(4000);
 	char from[256], to[256];
 	char *c, *mfrom, *mto;
@@ -14833,6 +15696,14 @@ static int transmit_state_notify(struct sip_pvt *p, struct state_notify_data *da
 	mto = remove_uri_parameters(c);
 
 	reqprep(&req, p, SIP_NOTIFY, 0, 1);
+
+/* AICS support for Armtel headers */
+    if(strstr(p->useragent,"IPN2.0")){
+      if(is_notify_outgoing_ind(p,p->username,p->exten,data->state)){
+	    add_header_with_value(&req, H_ARMTEL_SCENARIO, aics_scenario_to_str(AICS_SCENARIO_SELECTOR));
+	  }
+    }
+/* AICS support for Armtel headers */
 
 	switch(data->state) {
 	case AST_EXTENSION_DEACTIVATED:
@@ -15852,7 +16723,8 @@ static int expire_register(const void *data)
 		ast_endpoint_blob_publish(peer->endpoint, ast_endpoint_state_type(), blob);
 	}
 	register_peer_exten(peer, FALSE);	/* Remove regexten */
-	ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+	ast_devstate_changed_stub(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+
 
 	/* Do we need to release this peer from memory?
 		Only for realtime peers and autocreated peers
@@ -18550,6 +19422,7 @@ static enum check_auth_result check_peer_ok(struct sip_pvt *p, char *of,
 			peer->name, of, ast_sockaddr_stringify(&p->recv));
 	}
 
+	p->aics_local.spy = peer->spy;
 	/* XXX what about p->prefs = peer->prefs; ? */
 	/* Set Frame packetization */
 	if (p->rtp) {
@@ -18663,6 +19536,52 @@ static enum check_auth_result check_peer_ok(struct sip_pvt *p, char *of,
 		ast_string_field_set(p, peermd5secret, peer->md5secret);
 		ast_string_field_set(p, language, peer->language);
 		ast_string_field_set(p, accountcode, peer->accountcode);
+
+		/* AICS support for SIP 'Priority:' header */
+//		ast_log(LOG_NOTICE, "peer name [%s] of [%s]\n", peer->name, of);
+//		aics_pvt_addons_notice(&p->aics_addons, "before copy from peer");
+		if (!ast_strlen_zero(peer->priorityhandle)) {
+			p->aics_local.priority_handle = aics_priority_handle_from_str(peer->priorityhandle);
+		}
+		else {
+			p->aics_local.priority_handle = aics_priority_handle_from_str(global_priorityhandle);
+		}
+		if (!ast_strlen_zero(peer->hangupanounce)) {
+			p->aics_local.hangup_anounce = ast_strdup(peer->hangupanounce);
+		}
+		 else {
+			p->aics_local.hangup_anounce = ast_strdup(global_hangupanounce);
+		}
+		//ast_log(LOG_NOTICE, "peer %s peerpriority %s callpriority %s\n", peer->name, peer->callpriority, aics_priority_get(&p->aics_proxy));
+		if (!p->aics_proxy.validity.as_bits.priority) {
+			if (!ast_strlen_zero(peer->callpriority)) {
+				//p->aics_proxy.priority = aics_priority_from_str(peer->callpriority);
+				aics_priority_set(&p->aics_proxy, peer->callpriority);
+			} else {
+				aics_priority_set(&p->aics_proxy, global_callpriority);
+				//p->aics_proxy.priority = aics_priority_from_str(global_callpriority);
+			}
+		}
+//		const char *priostr = peer->callpriority;
+//		if (!ast_strlen_zero(priostr)) {
+//			int peerpriority = aics_priority_str2int(priostr);
+//			if ((p->aics_addons.callpriority != peerpriority) && (strcasecmp(p->useragent, global_ipn20UA))) {
+//				ast_log(LOG_NOTICE, "Override priority pvt '%d' from peer '%d'\n", p->aics_addons.callpriority, peerpriority);
+//				p->aics_addons.callpriority = peerpriority;
+//			}
+//		}
+//
+
+//		aics_pvt_addons_notice(&p->aics_addons, "after copy from peer");
+//		if (ast_strlen_zero(p->callpriority)) {
+//			const char *priostr = peer->callpriority;
+//			if (ast_strlen_zero(priostr))
+//				priostr = global_callpriority;
+//			ast_string_field_set(p, callpriority, priostr);
+//			//ast_log(LOG_NOTICE, "Set priority pvt '%s' from peer '%s'\n", p->callpriority, peer->callpriority);
+//		}
+		/* ~AICS */
+
 		p->amaflags = peer->amaflags;
 		p->callgroup = peer->callgroup;
 		p->pickupgroup = peer->pickupgroup;
@@ -18696,6 +19615,7 @@ static enum check_auth_result check_peer_ok(struct sip_pvt *p, char *of,
 		p->rtptimeout = peer->rtptimeout;
 		p->rtpholdtimeout = peer->rtpholdtimeout;
 		p->rtpkeepalive = peer->rtpkeepalive;
+		p->aics_local.spy = peer->spy;
 		if (!dialog_initialize_rtp(p)) {
 			if (p->rtp) {
 				ast_rtp_codecs_packetization_set(ast_rtp_instance_get_codecs(p->rtp), p->rtp, &peer->prefs);
@@ -18880,6 +19800,13 @@ static int set_message_vars_from_req(struct ast_msg *msg, struct sip_request *re
 	return res;
 }
 
+static int set_msg_var_with_value(struct ast_msg *msg, const char *name, const char *value)
+{
+	if (value)
+		return ast_msg_set_var(msg, name, value);
+	return 0;
+}
+
 /*! \brief  Receive SIP MESSAGE method messages
 \note	We only handle messages within current calls currently
 	Reference: RFC 3428 */
@@ -19058,8 +19985,17 @@ static void receive_message(struct sip_pvt *p, struct sip_request *req, struct a
 	ast_copy_string(stripped, sip_get_header(req, "Contact"), sizeof(stripped));
 	res |= ast_msg_set_var(msg, "SIP_FULLCONTACT", get_in_brackets(stripped));
 
+	res |= set_msg_var_with_value(msg, H_ARMTEL_RELAY, aics_relay_get(&p->aics_proxy));
+	res |= set_msg_var_with_value(msg, H_ARMTEL_EVENT, aics_event_get(&p->aics_proxy));
+	res |= set_msg_var_with_value(msg, H_ARMTEL_SCENARIO, aics_scenario_get(&p->aics_proxy));
+	res |= set_msg_var_with_value(msg, H_ARMTEL_DIRECTION, aics_direction_get(&p->aics_proxy));
+	res |= set_msg_var_with_value(msg, H_PRIORITY, aics_priority_get(&p->aics_proxy));
+	res |= set_msg_var_with_value(msg, H_ARMTEL_PLAYLIST, aics_playlist_get(&p->aics_proxy));
+
 	res |= ast_msg_set_exten(msg, "%s", p->exten);
 	res |= set_message_vars_from_req(msg, req);
+
+	//ast_log(LOG_NOTICE, "relay %s event %s res %d msg ref %p\n", ast_msg_get_var(msg, H_ARMTEL_RELAY), aics_event_get(&p->aics_proxy), res, msg);
 
 	if (res) {
 		ast_msg_destroy(msg);
@@ -20527,9 +21463,15 @@ static char *_sip_show_peer(int type, int fd, struct mansession *s, const struct
 		ast_cli(fd, ")\n");
 
 		ast_cli(fd, "  Auto-Framing : %s\n", AST_CLI_YESNO(peer->autoframing));
+		ast_cli(fd, "  Spy          : %s\n", AST_CLI_YESNO(peer->spy));
 		ast_cli(fd, "  Status       : ");
 		peer_status(peer, status, sizeof(status));
 		ast_cli(fd, "%s\n", status);
+		/* AICS support for SIP 'Priority:' header */
+		ast_cli(fd, "  Call Priority: %s\n", peer->callpriority);
+		ast_cli(fd, "  Priority Hdl : %s\n", peer->priorityhandle);
+		ast_cli(fd, "  HangupAnounce: %s\n", peer->hangupanounce);
+		/* ~AICS */
 		ast_cli(fd, "  Useragent    : %s\n", peer->useragent);
 		ast_cli(fd, "  Reg. Contact : %s\n", peer->fullcontact);
 		ast_cli(fd, "  Qualify Freq : %d ms\n", peer->qualifyfreq);
@@ -20548,6 +21490,9 @@ static char *_sip_show_peer(int type, int fd, struct mansession *s, const struct
 		ast_cli(fd, "  Parkinglot   : %s\n", peer->parkinglot);
 		ast_cli(fd, "  Use Reason   : %s\n", AST_CLI_YESNO(ast_test_flag(&peer->flags[1], SIP_PAGE2_Q850_REASON)));
 		ast_cli(fd, "  Encryption   : %s\n", AST_CLI_YESNO(ast_test_flag(&peer->flags[1], SIP_PAGE2_USE_SRTP)));
+#ifdef SIP_ARMTEL_QUEUE
+        ast_cli(fd, "  Armtel queue: %s\n", peer->armtel_queue);
+#endif		
 		ast_cli(fd, "\n");
 		peer = sip_unref_peer(peer, "sip_show_peer: sip_unref_peer: done with peer ptr");
 	} else  if (peer && type == 1) { /* manager listing */
@@ -20763,12 +21708,17 @@ static char *sip_show_user(struct ast_cli_entry *e, int cmd, struct ast_cli_args
  		ast_cli(a->fd, "  Sess-Expires : %d secs\n", user->stimer.st_max_se);
  		ast_cli(a->fd, "  Sess-Min-SE  : %d secs\n", user->stimer.st_min_se);
 		ast_cli(a->fd, "  RTP Engine   : %s\n", user->engine);
-
+		/* AICS support for SIP 'Priority:' header */
+		ast_cli(a->fd, "  Call Priority: %s\n", user->callpriority);
+		ast_cli(a->fd, "  Priority Hdl : %s\n", user->priorityhandle);
+		ast_cli(a->fd, "  HangupAnounce: %s\n", user->hangupanounce);
+		/* ~AICS */
 		ast_cli(a->fd, "  Codec Order  : (");
 		print_codec_to_cli(a->fd, &user->prefs);
 		ast_cli(a->fd, ")\n");
 
 		ast_cli(a->fd, "  Auto-Framing:  %s \n", AST_CLI_YESNO(user->autoframing));
+		ast_cli(a->fd, "  Spy         :  %s \n", AST_CLI_YESNO(user->spy));
 		if (user->chanvars) {
  			ast_cli(a->fd, "  Variables    :\n");
 			for (v = user->chanvars ; v ; v = v->next)
@@ -21255,6 +22205,74 @@ static char *sip_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	return CLI_SUCCESS;
 }
 
+#define AICS_SAFE_TIME(a,x) (a && !ast_strlen_zero(a)) ? (int) ast_tvdiff_ms(ast_tvnow(),x) : 0
+
+static char *sip_show_armtel(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+#define FORMAT1  "%-12.12s  %-30.30s(%10dms)  %-10.10s(%10dms)  %-10.10s\n"
+#define FORMAT2  "              %-30.30s(%10dms)  %-10.10s\n"
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "sip show armtel";
+		e->usage =
+			"Usage: sip show armtel\n"
+			"       Provides a list of Armtel event subscriptions and status.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+
+	if (a->argc >= 4) {
+		struct ae_provider ae_temp;
+		struct ae_provider *ae_ptr = &ae_temp;
+		enum AE_MATCH_RESULT ae_res = ae_find_provider(a->argv[3], NULL, &ae_ptr);
+		if (ae_res == AE_MATCH_NONE) {
+			ae_alloc(a->argv[3], NULL, "asterisk");
+		} else {
+			ae_destroy(ae_ptr);
+		}
+
+	}
+
+	//ast_cli(a->fd, FORMAT1, "Name", "CallId",0, "Has data",0, "Subscribers");
+	ast_cli(a->fd, "Name          CallId                                        Has data                  Subscriber\n");
+
+	struct ae_provider* cur = NULL;
+	struct ao2_iterator i = ao2_iterator_init(ae_providers, 0);
+	int providers_total = 0;
+
+
+	while ((cur = ao2_iterator_next(&i))) {
+		ao2_lock(cur);
+		int Has_subscribers = !AST_LIST_EMPTY(&cur->subscribers);
+
+		ast_cli(a->fd, FORMAT1, cur->name, cur->callid, AICS_SAFE_TIME(cur->callid, cur->time_updated), AST_CLI_YESNO(cur->body.data), AICS_SAFE_TIME(cur->body.data, cur->body.time_updated), AST_CLI_YESNO(Has_subscribers));
+
+		const struct ae_subscriber *subscriber = NULL;
+		int subscribers_total = 0;
+		//AST_LIST_LOCK(&cur->subscribers);
+		AST_LIST_TRAVERSE(&cur->subscribers, subscriber, next) {
+			//if (subscriber) {
+				ast_cli(a->fd, FORMAT2, subscriber->callid, AICS_SAFE_TIME(subscriber->callid, subscriber->time_updated), subscriber->name);
+				subscribers_total++;
+			//}
+		}
+		//AST_LIST_UNLOCK(&cur->subscribers);
+		if (subscribers_total)
+			ast_cli(a->fd, "              Provider %s has %d subscribers\n", cur->name, subscribers_total);
+		ao2_unlock(cur);
+		//dialog_unref(cur, "drop ref in iterator loop");
+		providers_total++;
+	}
+	ast_cli(a->fd, "%d Armtel event providers\n", providers_total);
+	ao2_iterator_destroy(&i);
+
+	return CLI_SUCCESS;
+#undef FORMAT1
+#undef FORMAT2
+}
+
 static char *sip_show_mwi(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
 {
 #define FORMAT  "%-30.30s  %-12.12s  %-10.10s  %-10.10s\n"
@@ -21283,7 +22301,6 @@ static char *sip_show_mwi(struct ast_cli_entry *e, int cmd, struct ast_cli_args 
 	return CLI_SUCCESS;
 #undef FORMAT
 }
-
 
 /*! \brief Show subscription type in string format */
 static const char *subscription_type2str(enum subscriptiontype subtype)
@@ -22546,6 +23563,8 @@ static int function_sippeer(struct ast_channel *chan, const char *cmd, char *dat
 		ast_copy_string(buf, peer->context, len);
 	} else  if (!strcasecmp(colname, "expire")) {
 		snprintf(buf, len, "%d", peer->expire);
+	} else  if (!strcasecmp(colname, "spy")) {
+		ast_copy_string(buf, peer->spy ? "yes" : "no", len);
 	} else  if (!strcasecmp(colname, "dynamic")) {
 		ast_copy_string(buf, peer->host_dynamic ? "yes" : "no", len);
 	} else  if (!strcasecmp(colname, "callerid_name")) {
@@ -22931,6 +23950,60 @@ static int sip_reinvite_retry(const void *data)
 	return 0;
 }
 
+
+// AICS send response
+void aics_response_update(struct sip_pvt *src_pvt, struct sip_request *src_req, struct sip_pvt *target_pvt, char *from, char *to)
+{
+	const char * reqcseq = sip_get_header(src_req, "CSeq");
+//	ast_log(LOG_NOTICE, "src_pvt '%d' cp '%d' r '%s' s '%d' pi '%s' cpi '%s'\n", src_pvt->ocseq, target_pvt->ocseq, reqcseq, seqno, sip_get_header(&(src_pvt->initreq), "CSeq"), sip_get_header(&(target_pvt->initreq), "CSeq"));
+	//ast_log(LOG_NOTICE, "i: src_pvt '%d' cp '%d' pm '%s' cm '%s' rm '%s'\n", src_pvt->icseq, target_pvt->icseq, sip_methods[src_pvt->method].text, sip_methods[target_pvt->method].text, sip_methods[src_req->method].text);
+
+	struct sip_request resp;
+	uint32_t tmp_seqno = src_pvt->aics_local.pendingupdate;
+	char tmp[80];
+	snprintf(tmp, sizeof(tmp), "%u %s", tmp_seqno, sip_methods[target_pvt->method].text);
+
+	//int sdpproc = -1, sdpfound = ;
+
+	if (find_sdp(src_req)) {
+		/*sdpproc =*/ process_sdp(src_pvt, src_req, SDP_T38_NONE);
+	}
+
+
+	init_resp(&resp, "200 OK");
+	add_header(&resp, "Via", target_pvt->via);
+	copy_all_header(&resp, src_req, "Record-Route");
+	add_header(&resp, "From", from);
+	add_header(&resp, "To", to);
+	add_header(&resp, "Call-ID", target_pvt->callid);
+	add_header(&resp, "CSeq", tmp);
+	if (!ast_strlen_zero(global_useragent))
+		add_header(&resp, "Server", global_useragent);
+	add_header(&resp, "Allow", ALLOWED_METHODS);
+	add_supported(target_pvt, &resp);
+	add_header(&resp, "Contact", target_pvt->our_contact);
+	//ast_set_flag(&target_pvt->flags[0], SIP_OUTGOING);
+//	if (ggscontrol) {
+//		//ast_rtp_instance_change_source(target_pvt->rtp);
+//		//ast_queue_control(target_pvt->owner, AST_CONTROL_UPDATE_RTP_PEER);
+//
+//		//ast_rtp_instance_change_source(src_pvt->rtp);
+//	} else {
+		ast_rtp_instance_change_source(src_pvt->rtp);
+//	}
+	//ast_rtp_instance_change_source(target_pvt->rtp);
+
+	if (target_pvt->t38.state == T38_DISABLED || target_pvt->t38.state == T38_REJECTED) {
+		add_sdp(&resp, target_pvt, FALSE, TRUE, FALSE);
+		//ast_queue_control(target_pvt->owner, AST_CONTROL_UPDATE_RTP_PEER);
+	} else {
+		add_sdp(&resp, target_pvt, FALSE, TRUE, TRUE);
+		//ast_queue_frame(target_pvt->owner, &ast_null_frame);
+	}
+	add_required_respheader(&resp);
+	//ast_clear_flag(&target_pvt->flags[0], SIP_OUTGOING);
+	/*int xmitres =*/ send_response(target_pvt, &resp, XMIT_UNRELIABLE, tmp_seqno);
+}
 /*!
  * \brief Handle authentication challenge for SIP UPDATE
  *
@@ -22938,6 +24011,184 @@ static int sip_reinvite_retry(const void *data)
  */
 static void handle_response_update(struct sip_pvt *p, int resp, const char *rest, struct sip_request *req, uint32_t seqno)
 {
+	/* AICS fully new support for UPDATE method */
+//	struct ast_channel *c=NULL;
+//	int res = 0;
+	char response[] = "200 OK";
+	RAII_VAR(struct ast_channel *, peer_channel, NULL, ast_channel_cleanup);
+
+	if (resp != 200) {
+		sprintf(response, sizeof(response), "%d", resp);
+	}
+
+	if (p->owner) {
+		RAII_VAR(struct ast_channel *, owner_relock, NULL, ast_channel_cleanup);
+		RAII_VAR(struct ast_channel *, owner_ref, NULL, ast_channel_cleanup);
+
+		/* Grab a reference to p->owner to prevent it from going away */
+		owner_ref = ast_channel_ref(p->owner);
+
+		/* Established locking order here is bridge, channel, pvt
+		 * and the bridge will be locked during ast_channel_bridge_peer */
+		ast_channel_unlock(owner_ref);
+		sip_pvt_unlock(p);
+
+		peer_channel = ast_channel_bridge_peer(owner_ref);
+
+		owner_relock = sip_pvt_lock_full(p);
+		if (!owner_relock) {
+			ast_debug(3, "Unable to reacquire owner channel lock, channel is gone\n");
+			return;
+		}
+	}
+
+	if (peer_channel) {
+		ast_channel_lock(peer_channel);
+		if (IS_SIP_TECH(ast_channel_tech(peer_channel))) {
+			struct sip_pvt *peer_pvt;
+
+			peer_pvt = ast_channel_tech_pvt(peer_channel);
+			if (peer_pvt) {
+				ao2_ref(peer_pvt, +1);
+				sip_pvt_lock(peer_pvt);
+
+				//transmit_response(peer_pvt, response, &peer_pvt->initreq);
+				transmit_response_with_sdp(peer_pvt, response, &peer_pvt->initreq, XMIT_UNRELIABLE, TRUE, FALSE);
+
+				sip_pvt_unlock(peer_pvt);
+				ao2_ref(peer_pvt, -1);
+			}
+		}
+		ast_channel_unlock(peer_channel);
+	}
+	return;
+
+/*
+	//ast_log(LOG_NOTICE, "hdl resp upd from '%s/%s' resp %d owner: %s\n", p->peername,p->useragent,resp,p->owner?ast_channel_name(p->owner):"null");
+	if ((resp == 200) && p->owner) {
+	//if ((resp == 200) && !strcasecmp(p->useragent, global_ipn20UA) && p->owner) {
+		struct ast_var_t *var;
+		struct aics_proxy_params *this_proxy = ast_channel_proxy(p->owner);
+		////char *target_name = (this_addons->ctrlchan ? this_addons->ctrlchan : NULL);
+		struct ast_channel *target_chan = NULL;
+		struct sip_pvt *target_pvt = NULL;
+		char *bridge_list = NULL;
+		char from[256];
+		char to[256];
+		char *reqfrom = ast_strdupa(sip_get_header(req, "From"));
+		char *reqto = ast_strdupa(sip_get_header(req, "To"));
+		//ast_log(LOG_NOTICE, "hdl resp upd from '%s' to '%s'\n", reqfrom, reqto);
+		size_t sf = strcspn(reqfrom, ";tag=");
+		size_t st = strcspn(reqto, ";tag=");
+
+		switch (this_proxy->scenario) {
+//		case AICS_SCENARIO_CONFERENCE:
+//
+//			break;
+		case AICS_SCENARIO_SELECTOR:
+		case AICS_SCENARIO_CIRCULAR:
+			aics_addons_notice(ast_channel_addons(p->owner), "Response Update on channel");
+//			if (!target_name) {
+//				ast_channel_lock(p->owner);
+//				aics_addons_notice(ast_channel_addons(p->owner), "Request Update on channel");
+//				AST_LIST_TRAVERSE(ast_channel_varshead(p->owner), var, entries) {
+//					ast_log(LOG_NOTICE, "%s=%s\n", ast_var_name(var), ast_var_value(var));
+//					if (!strcasecmp(ast_var_name(var), "AICSORIGINATE_CHANNEL")) {
+//						target_name = ast_strdupa(ast_var_value(var));
+//						break;
+//					}
+//				}
+//				ast_channel_unlock(p->owner);
+//				ast_channel_unref(p->owner);
+//			}
+			if (!target_name) {
+				ast_log(LOG_ERROR, "Channel name empty\n");
+				return ;
+			}
+			target_chan = ast_channel_get_by_name(target_name);
+			if (!target_chan) {
+				ast_log(LOG_ERROR, "Channel '%s' not found\n", target_name);
+				return ;
+			}
+			aics_addons_notice(ast_channel_addons(target_chan), "Response Update target");
+			target_pvt = ast_channel_tech_pvt(target_chan);
+			if (!target_pvt) {
+				ast_log(LOG_ERROR, "SIP_PVT not found in channel '%s'\n", target_name);
+				return ;
+			}
+			//ast_log(LOG_NOTICE,"p before ocseq %d pendupd %d\n",p->ocseq,p->pendingupdate);
+			//ast_log(LOG_NOTICE,"target before ocseq %d pendupd %d\n",target_pvt->ocseq,target_pvt->pendingupdate);
+
+			//transmit_response(target_pvt, "200 OK", &target_pvt->initreq);
+			//transmit_response_with_sdp(target_pvt, "200 OK", req, XMIT_UNRELIABLE, FALSE, FALSE);
+			if ((this_addons->pvt_addons.direction == AICS_DIRECTION_INACTIVE) ||
+					(this_addons->pvt_addons.last_direction == AICS_DIRECTION_INACTIVE)) {
+				target_pvt->pendingupdate = p->ocseq;
+			} else {
+				strncpy(to, reqto, st);
+				snprintf(to+st, sizeof(to)-st, "%s;tag=%s", ( ((to[0] == '<') && (to[st-1] != '>')) ? ">":"" ), target_pvt->tag);
+				strcpy(from, target_pvt->from);
+				//ast_log(LOG_NOTICE, "from '%s' %d to '%s' %d\n", from, (int)sf, to, (int)st);
+				aics_response_update(p, req, target_pvt, from, to);
+			}
+			//ast_log(LOG_NOTICE,"p after ocseq %d pendupd %d\n",p->ocseq,p->pendingupdate);
+			//ast_log(LOG_NOTICE,"target after ocseq %d pendupd %d\n",target_pvt->ocseq,target_pvt->pendingupdate);
+
+			break;
+		default:
+
+			if (!target_name) {
+				//ast_channel_lock(p->owner);
+				aics_addons_notice(ast_channel_addons(p->owner), "Request Update on channel");
+				AST_LIST_TRAVERSE(ast_channel_varshead(p->owner), var, entries) {
+					//ast_log(LOG_NOTICE, "%s=%s\n", ast_var_name(var), ast_var_value(var));
+					if (!strcasecmp(ast_var_name(var), "BRIDGEPEER")) {
+						bridge_list = ast_strdupa(ast_var_value(var));
+					}
+					if (!strcasecmp(ast_var_name(var), "BRIDGEPEER")) {
+						bridge_list = ast_strdupa(ast_var_value(var));
+					}
+					if (!strcasecmp(ast_var_name(var), "DIALEDPEERNAME")) {
+						target_name = ast_strdupa(ast_var_value(var));
+						break;
+					}
+				}
+				//ast_channel_unlock(p->owner);
+				//ast_channel_unref(p->owner);
+			}
+
+			if (!target_name) {
+				ast_log(LOG_ERROR, "Channel 'DIALEDPEERNAME' empty\n");
+				if (bridge_list) {
+					char *saveptr;
+					target_name = strtok_r(bridge_list, ",", &saveptr);
+				}
+				if (!target_name) {
+					ast_log(LOG_ERROR, "Channel 'BRIDGEPEER' empty too\n");
+					return ;
+				}
+			}
+			target_chan = ast_channel_get_by_name(target_name);
+			if (!target_chan) {
+				ast_log(LOG_ERROR, "Channel '%s' not found\n", target_name);
+				return ;
+			}
+			target_pvt = ast_channel_tech_pvt(target_chan);
+			if (!target_pvt) {
+				ast_log(LOG_ERROR, "SIP_PVT not found in channel '%s'\n", target_name);
+				return ;
+			}
+			strncpy(from, reqfrom, sf);
+			strncpy(to, reqto, st);
+			//ast_log(LOG_NOTICE, "from '%s' %d to '%s' %d\n", from, (int)sf, to, (int)st);
+			snprintf(from+sf, sizeof(from)-sf, ";tag=%s", target_pvt->theirtag);
+			snprintf(to+st, sizeof(to)-st, "%s;tag=%s", ( ((to[0] == '<') && (to[st-1] != '>')) ? ">":"" ), target_pvt->tag);
+			aics_response_update(p, req, target_pvt, from, to);
+		}
+		return;
+	}
+	/* ~AICS */
+
 	if (p->options) {
 		p->options->auth_type = (resp == 401 ? WWW_AUTH : PROXY_AUTH);
 	}
@@ -23092,6 +24343,9 @@ static void handle_response_invite(struct sip_pvt *p, int resp, const char *rest
 	int rtn;
 	struct ast_party_connected_line connected;
 	struct ast_set_party_connected_line update_connected;
+
+//const char * reqcseq = sip_get_header(req, "CSeq");
+//ast_log(LOG_NOTICE, "p '%d' r '%s' s '%d'\n", p->ocseq, reqcseq, seqno);
 
 	if (reinvite) {
 		ast_debug(4, "SIP response %d to RE-invite on %s call %s\n", resp, outgoing ? "outgoing" : "incoming", p->callid);
@@ -23310,6 +24564,7 @@ static void handle_response_invite(struct sip_pvt *p, int resp, const char *rest
 			ast_log(LOG_WARNING, "Unable to cancel SIP destruction.  Expect bad things.\n");
 		}
 		p->authtries = 0;
+		//ast_log(LOG_NOTICE, "Resp OK ignore '%d' peername '%s'\n", req->ignore, p->peername);
 		if (find_sdp(req)) {
 			if ((res = process_sdp(p, req, SDP_T38_ACCEPT)) && !req->ignore) {
 				if (!reinvite) {
@@ -23621,52 +24876,108 @@ static void handle_response_invite(struct sip_pvt *p, int resp, const char *rest
   */
 static void handle_response_notify(struct sip_pvt *p, int resp, const char *rest, struct sip_request *req, uint32_t seqno)
 {
-	switch (resp) {
-	case 200:   /* Notify accepted */
-		/* They got the notify, this is the end */
-		if (p->owner) {
-			if (p->refer) {
-				ast_log(LOG_NOTICE, "Got OK on REFER Notify message\n");
+	if (p->subscribed == AIDF_XML) {
+//		struct sip_peer *peer = sip_ref_peer(p->relatedpeer, "response notify ref peer");
+//		struct sip_peer *peer2subscribe = sip_find_peer(p->exten, NULL, TRUE, FINDALLDEVICES, FALSE, 0);
+//
+//		if (peer2subscribe) {
+
+//			if (AST_LIST_EMPTY(&peer2subscribe->armtelsubs)) {
+//				struct sip_pvt *pvt;
+//				if (!(pvt = sip_alloc(NULL, NULL, 0, SIP_SUBSCRIBE, NULL, NULL))) {
+//					transmit_response(p, "500 Internal Server Error", req);
+//					ast_debug(2, "SIP subscribe cannot alloc pvt\n");
+//					pvt_set_needdestroy(p, "cannot alloc pvt");
+//
+//					return;
+//				}
+//				set_socket_transport(&pvt->socket, 0);
+//				if (create_addr_from_peer(pvt, peer2subscribe)) {
+//					/* Maybe they're not registered, etc. */
+//					dialog_unlink_all(pvt);
+//					dialog_unref(pvt, "unref dialog pvt just created via sip_alloc");
+//					transmit_response(p, "500 Internal Server Error", req);
+//					ast_debug(2, "SIP subscribe cannot create addr from peer\n");
+//					pvt_set_needdestroy(p, "cannot create addr from peer");
+//					return;
+//				}
+//				/* Recalculate our side, and recalculate Call ID */
+//				ast_sip_ouraddrfor(&pvt->sa, &pvt->ourip, pvt);
+//				//build_via(pvt);
+//				/* Change the dialog callid. */
+//				//change_callid_pvt(pvt, NULL);
+//				/* Destroy this session after 32 secs */
+//				sip_scheddestroy(pvt, DEFAULT_TRANS_TIMEOUT);
+//
+//				ast_set_flag(&pvt->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
+//				pvt->subscribed = p->subscribed;
+//				pvt->expiry = p->expiry;
+//				pvt->relatedpeer = sip_ref_peer(peer2subscribe, "subscribe armtel: setting dialog's relatedpeer pointer");
+//				peer2subscribe->call = dialog_ref(p, "copying subscribe dialog");
+//				sip_pvt_lock(pvt);
+//				/* Send armtel subscription */
+//				ast_set_flag(&pvt->flags[0], SIP_OUTGOING);
+//				/* the following will decrement the refcount on p as it finishes */
+//				transmit_invite(pvt, SIP_SUBSCRIBE, 0, 2, NULL);
+//				sip_pvt_unlock(pvt);
+//				dialog_unref(pvt, "unref dialog ptr pvt just before it goes out of scope at the end of subscribe armtel.");
+//
+//				//return 0;
+//			} else {
+//				add_peer_armtel_subscriber(peer2subscribe, peer->name);
+//				transmit_response(p, "200 OK", req);
+//			}
+//			ao2_cleanup(peer2subscribe);
+//		}
+//		peer =  sip_unref_peer(peer, "response notify unref peer");
+	} else {
+		switch (resp) {
+		case 200:   /* Notify accepted */
+			/* They got the notify, this is the end */
+			if (p->owner) {
+				if (p->refer) {
+					ast_log(LOG_NOTICE, "Got OK on REFER Notify message\n");
+				} else {
+					ast_log(LOG_WARNING, "Notify answer on an owned channel? - %s\n", ast_channel_name(p->owner));
+				}
 			} else {
-				ast_log(LOG_WARNING, "Notify answer on an owned channel? - %s\n", ast_channel_name(p->owner));
+				if (p->subscribed == NONE && !p->refer) {
+					ast_debug(4, "Got 200 accepted on NOTIFY %s\n", p->callid);
+					pvt_set_needdestroy(p, "received 200 response");
+				}
+				if (ast_test_flag(&p->flags[1], SIP_PAGE2_STATECHANGEQUEUE)) {
+					struct state_notify_data data = {
+						.state = p->laststate,
+						.device_state_info = p->last_device_state_info,
+						.presence_state = p->last_presence_state,
+						.presence_subtype = p->last_presence_subtype,
+						.presence_message = p->last_presence_message,
+					};
+					/* Ready to send the next state we have on queue */
+					ast_clear_flag(&p->flags[1], SIP_PAGE2_STATECHANGEQUEUE);
+					extensionstate_update(p->context, p->exten, &data, p, TRUE);
+				}
 			}
-		} else {
-			if (p->subscribed == NONE && !p->refer) {
-				ast_debug(4, "Got 200 accepted on NOTIFY %s\n", p->callid);
-				pvt_set_needdestroy(p, "received 200 response");
+			break;
+		case 401:   /* Not www-authorized on SIP method */
+		case 407:   /* Proxy auth */
+			if (!p->notify) {
+				break; /* Only device notify can use NOTIFY auth */
 			}
-			if (ast_test_flag(&p->flags[1], SIP_PAGE2_STATECHANGEQUEUE)) {
-				struct state_notify_data data = {
-					.state = p->laststate,
-					.device_state_info = p->last_device_state_info,
-					.presence_state = p->last_presence_state,
-					.presence_subtype = p->last_presence_subtype,
-					.presence_message = p->last_presence_message,
-				};
-				/* Ready to send the next state we have on queue */
-				ast_clear_flag(&p->flags[1], SIP_PAGE2_STATECHANGEQUEUE);
-				extensionstate_update(p->context, p->exten, &data, p, TRUE);
+			ast_string_field_set(p, theirtag, NULL);
+			if (ast_strlen_zero(p->authname)) {
+				ast_log(LOG_WARNING, "Asked to authenticate NOTIFY to %s but we have no matching peer or realm auth!\n", ast_sockaddr_stringify(&p->recv));
+				pvt_set_needdestroy(p, "unable to authenticate NOTIFY");
 			}
+			if (p->authtries > 1 || do_proxy_auth(p, req, resp, SIP_NOTIFY, 0)) {
+				ast_log(LOG_NOTICE, "Failed to authenticate on NOTIFY to '%s'\n", sip_get_header(&p->initreq, "From"));
+				pvt_set_needdestroy(p, "failed to authenticate NOTIFY");
+			}
+			break;
+		case 481: /* Call leg does not exist */
+			pvt_set_needdestroy(p, "Received 481 response for NOTIFY");
+			break;
 		}
-		break;
-	case 401:   /* Not www-authorized on SIP method */
-	case 407:   /* Proxy auth */
-		if (!p->notify) {
-			break; /* Only device notify can use NOTIFY auth */
-		}
-		ast_string_field_set(p, theirtag, NULL);
-		if (ast_strlen_zero(p->authname)) {
-			ast_log(LOG_WARNING, "Asked to authenticate NOTIFY to %s but we have no matching peer or realm auth!\n", ast_sockaddr_stringify(&p->recv));
-			pvt_set_needdestroy(p, "unable to authenticate NOTIFY");
-		}
-		if (p->authtries > 1 || do_proxy_auth(p, req, resp, SIP_NOTIFY, 0)) {
-			ast_log(LOG_NOTICE, "Failed to authenticate on NOTIFY to '%s'\n", sip_get_header(&p->initreq, "From"));
-			pvt_set_needdestroy(p, "failed to authenticate NOTIFY");
-		}
-		break;
-	case 481: /* Call leg does not exist */
-		pvt_set_needdestroy(p, "Received 481 response for NOTIFY");
-		break;
 	}
 }
 
@@ -23689,9 +25000,122 @@ static void handle_response_subscribe(struct sip_pvt *p, int resp, const char *r
 				"Received error response to our SUBSCRIBE");
 		}
 		return;
-	}
+	} else if (p->subscribed == AIDF_XML) {
 
-	if (p->subscribed != MWI_NOTIFICATION) {
+
+		ast_log(LOG_NOTICE, "peer %s cid %s exten %s\n", p->peername, p->callid, p->exten);
+
+		struct ae_provider ae_tmp_prov;// = { 0, };
+		struct ae_provider *ae_pprov = &ae_tmp_prov;
+		enum AE_MATCH_RESULT ae_match = ae_find_provider(p->peername, NULL, &ae_pprov);
+
+		if (ae_match == AE_MATCH_NONE) {
+			ast_log(LOG_WARNING, "Failed to find Armtel event provider %s\n", p->peername);
+			return;
+		} else {
+			//ae_destroy(ae_pprov);
+			ae_update_provider_callid(ae_pprov, p->callid);
+		}
+
+//		struct ae_subscriber ae_tmp_sub;// = { 0, };
+//		struct ae_subscriber *ae_psub = &ae_tmp_sub;
+//		ae_match = ae_find_subscriber(ae_pprov, p->peername, p->callid, &ae_psub);
+//		if (ae_match == AE_MATCH_NONE) {
+//			if (ae_add_subscriber(ae_pprov, p->peername, p->callid)) {
+//
+//			} else {
+//				ast_log(LOG_WARNING, "Failed to add Armtel event subscriber\n");
+//				return 0;
+//			}
+//		} else if (ae_match == AE_MATCH_NAME) {
+//			ast_log(LOG_NOTICE, "Refreshing subscriber callid\n");
+//			ae_update_subscriber_callid(ae_psub, p->callid);
+//			//ast_copy_string(ae_psub->callid, p->callid, sizeof(ae_psub->callid));
+//		}
+//
+//		transmit_response(p, "200 OK", req);
+//
+//		if (ast_strlen_zero(ae_pprov->callid)) {
+//			// trying to send subscribe to provider
+//			struct sip_peer *peer2subscribe = sip_find_peer(p->exten, NULL, TRUE, FINDALLDEVICES, FALSE, 0);
+//			if (peer2subscribe) {
+//				struct sip_pvt *pvt;
+//				if (!(pvt = sip_alloc(NULL, NULL, 0, SIP_SUBSCRIBE, NULL, NULL))) {
+//					ast_debug(2, "SIP subscribe cannot alloc pvt\n");
+//					return 0;
+//				}
+//				set_socket_transport(&pvt->socket, 0);
+//				if (create_addr_from_peer(pvt, peer2subscribe)) {
+//					dialog_unlink_all(pvt);
+//					dialog_unref(pvt, "unref dialog pvt just created via sip_alloc");
+//					ast_debug(2, "SIP subscribe cannot create addr from peer\n");
+//					return 0;
+//				}
+//				ast_sip_ouraddrfor(&pvt->sa, &pvt->ourip, pvt);
+//				ast_set_flag(&pvt->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
+//				pvt->subscribed = p->subscribed;
+//				pvt->expiry = p->expiry;
+//				if (pvt->expiry > 0)
+//					sip_scheddestroy(pvt, (pvt->expiry + 10) * 1000);
+//
+//				sip_pvt_lock(pvt);
+//				/* Send armtel subscription */
+//				ast_set_flag(&pvt->flags[0], SIP_OUTGOING);
+//				/* the following will decrement the refcount on pvt as it finishes */
+//				transmit_invite(pvt, SIP_SUBSCRIBE, 0, 2, NULL);
+//				sip_pvt_unlock(pvt);
+//			}
+//
+//		}
+
+//		struct sip_peer *peer = sip_ref_peer(p->relatedpeer, "response subscribe ref peer");//sip_find_peer(p->name, NULL, TRUE, FINDALLDEVICES, FALSE, 0);
+//		int gotdest = get_destination(p, NULL, NULL);
+//		if (!peer) {
+//			ast_log(LOG_NOTICE, "no related peer :(\n");
+//			return;
+//		}
+//		ast_log(LOG_NOTICE, "peer %s cid %s\n", peer->name, p->callid);
+//		struct sip_armtel_subs * sub = AST_LIST_FIRST(&peer->armtel_event.armtel_subs);
+//		if (!sub) {
+//			ast_log(LOG_NOTICE, "empty list in subscription response!\n");
+//			return;
+//		}
+//		ast_log(LOG_NOTICE, "sub %s cid %s type %d\n", sub->name, sub->callid, peer->armtel_event.armtel_type);
+//		struct sip_pvt *sip_pvt_ptr;
+//		struct sip_pvt tmp_dialog = {
+//			.callid = sub->callid,
+//		};
+//		sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+//		if (!sip_pvt_ptr) {
+//			ast_log(LOG_NOTICE, "no dialog found in subscription response!\n");
+//			pvt_set_needdestroy(p, "no dialog found in subscription response");
+//			return;
+//
+//			ast_log(LOG_NOTICE, "Marking old pvt %s to be destroyed!\n",sip_pvt_ptr->callid);
+//			pvt_set_needdestroy(sip_pvt_ptr, "refresh subscription");
+//		}
+//		char buf[200];
+//		if (resp == 200) {
+//			//ast_log(LOG_NOTICE, "p-exten %s cidnum %s cidname %s fromname %s\n", p->exten, p->cid_num, p->cid_name, p->fromname);
+//			//int localres = add_peer_armtel_subscriber(peer, p->cid_name);
+//			//ast_string_field_set(p, cid_name, NULL);
+//			//ast_log(LOG_NOTICE, "Added 1st subscriber res %d\n", localres);
+//			ast_log(LOG_NOTICE, "Added 1st subscriber res\n");
+//			snprintf(buf, sizeof(buf), "%d OK", resp);
+//			peer->armtel_event.armtel_type = AE_NOTIFIER;
+//		} else {
+//			snprintf(buf, sizeof(buf), "%d (peer response)", resp);
+//			pvt_set_needdestroy(p, "peer rejected subscribe");
+//			clear_peer_armtel_event(peer);
+//
+//		}
+//		transmit_response(sip_pvt_ptr, buf, &sip_pvt_ptr->initreq);
+//		dialog_unref(sip_pvt_ptr, "response subscribe unref call");
+//		peer =  sip_unref_peer(peer, "response subscribe unref peer");
+
+		return;
+
+	} else if (p->subscribed != MWI_NOTIFICATION) {
 		return;
 	}
 	if (!p->mwi) {
@@ -24058,6 +25482,7 @@ static void handle_response_peerpoke(struct sip_pvt *p, int resp, struct sip_req
 
 		ast_log(LOG_NOTICE, "Peer '%s' is now %s. (%dms / %dms)\n",
 			peer->name, s, pingtime, peer->maxms);
+//log_peer_armtel_sub(peer);
 		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 		if (sip_cfg.peer_rtupdate) {
 			ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name, "lastms", str_lastms, SENTINEL);
@@ -24173,6 +25598,7 @@ static void handle_response_message(struct sip_pvt *p, int resp, const char *res
 	int sipmethod = SIP_MESSAGE;
 	int in_dialog = ast_test_flag(&p->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
 
+
 	switch (resp) {
 	case 401: /* Not www-authorized on SIP method */
 	case 407: /* Proxy auth required */
@@ -24197,6 +25623,34 @@ static void handle_response_message(struct sip_pvt *p, int resp, const char *res
 			/* Must allow provisional responses for out-of-dialog requests. */
 		} else if (200 <= resp && resp < 300) {
 			p->authtries = 0;	/* Reset authentication counter */
+/* ~AICS */
+/*
+            int start=0;
+            unsigned char cmd,context;
+			char *sign=__get_header(req,H_ARMTEL_SIGN,&start);
+            if(get_armtel_sign(sign,&cmd,&context)){
+              switch(cmd){
+		          case AICS_ARMTEL_ASK_WORD:
+			  //     aics_send_armtel_sign(p->owner,AICS_ARMTEL_DIRECTION,0,AICS_CONTEXT_ARMTEL_ACT_SPEAK);
+			  //     ast_log(LOG_WARNING, "(%s)ASK_WORD context=%d;\n",ast_channel_name(p->owner),context);
+			      break;
+		          case AICS_ARMTEL_REMOVE_WORD:
+			 //      aics_send_armtel_sign(p->owner,AICS_ARMTEL_DIRECTION,0,AICS_CONTEXT_ARMTEL_ACT_LISTEN);
+			 //      ast_log(LOG_WARNING, "REMOVE_WORD context=%d\n",context);
+			      break;
+		          case AICS_ARMTEL_INTERRUPT_WORD:
+			      break;
+		          case AICS_ARMTEL_DIRECTION:
+			 //       ast_log(LOG_WARNING, "DIRECTION context=%d \n",context);
+			      break;
+		          case AICS_ARMTEL_DISKRET3:
+			        break;
+		          case AICS_ARMTEL_CHANGE_STATE_CONF:
+			      break;
+		      }
+            }
+*/
+/* ~AICS */
 			if (!in_dialog) {
 				pvt_set_needdestroy(p, "MESSAGE delivery accepted");
 			}
@@ -24242,6 +25696,8 @@ static void handle_response(struct sip_pvt *p, int resp, const char *rest, struc
 		msg = "";
 
 	sipmethod = find_sip_method(msg);
+//if (sipmethod != SIP_OPTIONS)
+//ast_log(LOG_NOTICE, "method '%s' cid '%s' peer '%s'\n", sip_methods[sipmethod].text, p->callid, p->peername);
 
 	owner = p->owner;
 	if (owner) {
@@ -24283,7 +25739,7 @@ static void handle_response(struct sip_pvt *p, int resp, const char *rest, struc
 			if (sipmethod == SIP_INVITE && resp >= 200) {
 				transmit_request(p, SIP_ACK, seqno, XMIT_UNRELIABLE, resp < 300 ? TRUE: FALSE);
 			}
-
+//ast_log(LOG_NOTICE, "ignore retransmit");
 			append_history(p, "Ignore", "Ignoring this retransmit\n");
 			return;
 		}
@@ -24338,6 +25794,8 @@ static void handle_response(struct sip_pvt *p, int resp, const char *rest, struc
 		 * we just always call the response handler. Good gravy!
 		 */
 		handle_response_publish(p, resp, rest, req, seqno);
+	} else if (sipmethod == SIP_UPDATE) {
+		handle_response_update(p, resp, rest, req, seqno);
 	} else if (sipmethod == SIP_INFO) {
 		/* More good gravy! */
 		handle_response_info(p, resp, rest, req, seqno);
@@ -24364,6 +25822,8 @@ static void handle_response(struct sip_pvt *p, int resp, const char *rest, struc
 				handle_response_invite(p, resp, rest, req, seqno);
 			} else if (sipmethod == SIP_REGISTER) {
 				handle_response_register(p, resp, rest, req, seqno);
+			} else if (sipmethod == SIP_UPDATE) {
+				handle_response_update(p, resp, rest, req, seqno);
 			} else if (sipmethod == SIP_SUBSCRIBE) {
 				ast_set_flag(&p->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
 				handle_response_subscribe(p, resp, rest, req, seqno);
@@ -24619,6 +26079,8 @@ static void handle_response(struct sip_pvt *p, int resp, const char *rest, struc
 		case 200:
 			if (sipmethod == SIP_INVITE) {
 				handle_response_invite(p, resp, rest, req, seqno);
+			} else if (sipmethod == SIP_UPDATE) {
+				handle_response_update(p, resp, rest, req, seqno);
 			} else if (sipmethod == SIP_CANCEL) {
 				ast_debug(1, "Got 200 OK on CANCEL\n");
 
@@ -24804,6 +26266,94 @@ static int handle_cc_notify(struct sip_pvt *pvt, struct sip_request *req)
 	return 0;
 }
 
+/* AICS Transmit armtel event notify */
+static int transmit_notify_with_armtel(struct sip_pvt *p, char * body, uint32_t seqno)
+{
+	struct sip_request req;
+	const struct cfsubscription_types *subscriptiontype = NULL;
+
+	if (!body)
+		return -10;
+	initreqprep(&req, p, SIP_NOTIFY, NULL);
+	p->branch ^= ast_random();
+	build_via(p);
+	subscriptiontype = find_subscription_type(AIDF_XML);
+	if (!subscriptiontype)
+		return -20;
+	add_header(&req, "Event", subscriptiontype->event);
+	add_header(&req, "Content-Type", subscriptiontype->mediatype);
+
+//	/* domain initialization occurs here because initreqprep changes ast_sockaddr_stringify string. */
+//	domain = S_OR(p->fromdomain, ast_sockaddr_stringify_host_remote(&p->ourip));
+	if (p->subscribed) {
+		if (p->expiry) {
+			add_header(&req, "Subscription-State", "active");
+		} else {	/* Expired */
+			add_header(&req, "Subscription-State", "terminated;reason=timeout");
+		}
+	}
+	char *body_copy = ast_strdupa(body);
+//	char *crlf = strstr(body_copy, "\r\n");
+	int len = strlen(body_copy);
+	if ((len > 1) && (body_copy[len-2] == '\r') && (body_copy[len-1] == '\n')) {
+		body_copy[len-2] = '\0';
+	}
+	add_content(&req, body_copy);//ast_str_buffer(body));
+
+//	if (!p->initreq.headers) {
+//		initialize_initreq(p, &req);
+//	}
+	ast_log(LOG_NOTICE, "seqno %d ocseq %d icseq %d ii %d\n",seqno, p->ocseq, p->icseq, p->init_icseq);
+	return send_request(p, &req, XMIT_UNRELIABLE, seqno);
+}
+
+/* AICS Transmit armtel event notify */
+static int armtel_provider_status_update(struct ae_provider *provider, const char* body)
+{
+	if (!provider)
+		return 1;
+	// copy body
+	ae_update_provider_body(provider, body);
+
+	// status notify all subscribers
+	const struct ae_subscriber *subscriber = NULL;
+	AST_LIST_TRAVERSE_SAFE_BEGIN(&provider->subscribers, subscriber, next) {
+		struct sip_pvt *sip_pvt_ptr;
+		struct sip_pvt tmp_dialog = {
+			.callid = subscriber->callid,
+		};
+		sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+		if (sip_pvt_ptr) {
+			transmit_notify_with_armtel(sip_pvt_ptr, body, 1+sip_pvt_ptr->icseq);
+		} else {
+			AST_LIST_REMOVE_CURRENT(next);
+			ast_free(subscriber);
+		}
+	}
+	AST_LIST_TRAVERSE_SAFE_END;
+	return 0;
+}
+
+static void armtel_provider_discard(const char* name)
+{
+	struct ae_provider ae_temp;
+	struct ae_provider *ae_ptr = &ae_temp;
+	enum AE_MATCH_RESULT ae_res = ae_find_provider(name, NULL, &ae_ptr);
+	if (ae_res != AE_MATCH_NONE) {
+		ast_log(LOG_NOTICE, "Discard provider subscription %s\n", ae_ptr->callid);
+		struct sip_pvt *sip_pvt_ptr;
+		struct sip_pvt tmp_dialog = {
+			.callid = ae_ptr->callid,
+		};
+		sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+		if (sip_pvt_ptr) {
+			sip_scheddestroy(sip_pvt_ptr, DEFAULT_TRANS_TIMEOUT);
+		}
+		ae_update_provider_callid(ae_ptr, NULL);
+		armtel_provider_status_update(ae_ptr, ae_build_body(ae_ptr->uri));
+	}
+}
+
 /*! \brief Handle incoming notifications */
 static int handle_request_notify(struct sip_pvt *p, struct sip_request *req, struct ast_sockaddr *addr, uint32_t seqno, const char *e)
 {
@@ -24958,6 +26508,202 @@ static int handle_request_notify(struct sip_pvt *p, struct sip_request *req, str
 		transmit_response(p, "200 OK", req);
 	} else if (!strcmp(event, "call-completion")) {
 		res = handle_cc_notify(p, req);
+	} else if (!strcmp(event, "armtel")) { /* AICS armtel event package */
+		res = -1;
+		// check body
+		char *buf = NULL;
+		if (ast_strlen_zero(buf = get_content_crlf(req))) {
+			ast_log(LOG_WARNING, "Unable to retrieve attachment from NOTIFY %s\n", p->callid);
+			transmit_response(p, "400 Bad request", req);
+			sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+			return res;
+		}
+		int iscommand = (strstr(buf, "command") ? 1 : 0);
+		ast_log(LOG_NOTICE, "peer %s cid %s exten %s command %s\n", p->peername, p->callid, p->exten, AST_YESNO(iscommand));
+
+		if (iscommand) {
+			/* Get full contact header - this needs to be used as a request URI in NOTIFY's */
+			parse_ok_contact(p, req);
+			build_contact(p);
+			/* Get destination right away */
+			int gotdest = get_destination(p, NULL, NULL);
+			if (gotdest != SIP_GET_DEST_EXTEN_FOUND) {
+				ast_log(LOG_WARNING, "Unable to find destination from NOTIFY %s\n", p->callid);
+				transmit_response(p, "400 Bad request", req);
+				sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+				return res;
+			}
+			ast_log(LOG_NOTICE, "peer %s cid %s exten %s command %s\n", p->peername, p->callid, p->exten, AST_YESNO(iscommand));
+			struct ae_provider ae_tmp_prov;
+			struct ae_provider *ae_pprov = &ae_tmp_prov;
+			enum AE_MATCH_RESULT ae_match = ae_find_provider(p->exten, NULL, &ae_pprov);
+
+			if (ae_match == AE_MATCH_NONE) {
+				ast_log(LOG_WARNING, "Failed to find Armtel event provider %s\n", p->exten);
+				transmit_response(p, "489 Bad event (no armtel subscription)", req);
+				return res;
+			} else {
+				struct sip_pvt *sip_pvt_ptr;
+				struct sip_pvt tmp_dialog = {
+					.callid = ae_pprov->callid,
+				};
+				sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+				if (sip_pvt_ptr) {
+					transmit_notify_with_armtel(sip_pvt_ptr, buf, 1+sip_pvt_ptr->icseq);
+				} else {
+					ae_update_provider_callid(ae_pprov, NULL);
+				}
+			}
+			res = 0;
+		} else {
+			struct ae_provider ae_tmp_prov;
+			struct ae_provider *ae_pprov = &ae_tmp_prov;
+			enum AE_MATCH_RESULT ae_match = ae_find_provider(p->peername, p->callid, &ae_pprov);
+
+			if (ae_match == AE_MATCH_NONE) {
+				ast_log(LOG_WARNING, "Failed to find Armtel event provider %s\n", p->peername);
+				transmit_response(p, "489 Bad event (no armtel subscription)", req);
+				return res;
+			} else {
+
+				// check callid
+				if (ae_match == AE_MATCH_NAME) {
+					// Oo? smth strange, new callid in notify
+					struct sip_pvt *sip_pvt_ptr;
+					struct sip_pvt tmp_dialog = {
+						.callid = ae_pprov->callid,
+					};
+					sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+					if (sip_pvt_ptr) {
+						sip_scheddestroy(sip_pvt_ptr, DEFAULT_TRANS_TIMEOUT);
+					}
+					ae_update_provider_callid(ae_pprov, p->callid);
+				}
+
+				res = armtel_provider_status_update(ae_pprov, buf);
+
+			}
+		}
+//		char *buf = NULL;
+//		struct sip_peer *peer = sip_find_peer(NULL, &p->recv, TRUE, FINDPEERS, FALSE, p->socket.type);
+//		/* Get the text of the attachment */
+//		if (ast_strlen_zero(buf = get_content_crlf(req))) {
+//			ast_log(LOG_WARNING, "Unable to retrieve attachment from NOTIFY %s\n", p->callid);
+//			transmit_response(p, "400 Bad request", req);
+//			sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+//			return res;
+//		}
+//		if (!peer) {
+//			ast_log(LOG_NOTICE, "no related peer :(\n");
+//			return res;
+//		}
+//		uint32_t reqseqno;
+//		if (sscanf(sip_get_header(req, "CSeq"), "%30u ", &reqseqno) != 1) {
+//			ast_log(LOG_NOTICE, "no CSeq in req :(\n");
+//			return res;
+//		}
+//		switch (peer->armtel_event.armtel_type) {
+//		case AE_UNSET: {
+//			//res = -1;
+//			ast_log(LOG_NOTICE, "No armtel subscription\n");
+//			transmit_response(p, "489 Bad event (no armtel subscription)", req);
+//		} break;
+//		case AE_SUBSCRIBER: {
+//			int gotdest = get_destination(p, NULL, NULL);
+//			ast_log(LOG_NOTICE, "this is subscriber. exten %s cid %s from %s gotdest %d reqseq %d\n", p->exten, p->callid, p->from, gotdest, reqseqno);
+//
+//			struct sip_armtel_subs *sub;
+//			struct sip_pvt *sip_pvt_ptr;
+//			AST_LIST_TRAVERSE_SAFE_BEGIN(&peer->armtel_event.armtel_subs, sub, nextsub) {
+//				if (!strcmp(sub->name, p->exten)) {
+//					struct sip_pvt tmp_dialog = {
+//						.callid = sub->callid,
+//					};
+//					sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+//					if (sip_pvt_ptr) {
+//						break;
+//					} else {
+//						AST_LIST_REMOVE_CURRENT(nextsub);
+//						destroy_armtel_subscriber(sub);
+//					}
+//				}
+//			}
+//			AST_LIST_TRAVERSE_SAFE_END;
+//			if(!sip_pvt_ptr) {
+//				ast_log(LOG_NOTICE, "no call found\n");
+//				//peer->armtel_event.armtel_type = AE_UNSET;
+//			} else {
+////				sip_pvt_ptr->ocseq = sip_pvt_ptr->icseq;
+////				sip_pvt_ptr->icseq = reqseqno;
+////				/*int local*/res = transmit_notify_with_armtel(sip_pvt_ptr, buf, sip_pvt_ptr->ocseq);
+//				/*int local*/res = transmit_notify_with_armtel(sip_pvt_ptr, buf, 1+sip_pvt_ptr->ocseq);
+//				ast_log(LOG_NOTICE, "transmited COMMAND notify with %d to cid %s\n" , /*local*/res, sip_pvt_ptr->callid);
+//			}
+//		} break;
+//		case AE_NOTIFIER: {
+//			ast_log(LOG_NOTICE, "this is notifier. exten %s cid %s reqseq %d\n", p->exten, p->callid, reqseqno);
+//
+//			// update status
+//			ast_str_reset(peer->armtel_event.armtel_body);
+////			clear_peer_armtel_body(peer);
+////			if (!(peer->armtel_event.armtel_body = ast_str_create(strlen(buf)+1))) {
+////				ast_log(LOG_NOTICE, "failed to allocate armtel_body for peer\n");
+////				break;
+////			}
+//			int copyres = ast_str_set(&peer->armtel_event.armtel_body, 0, "%s", buf);
+//			ast_log(LOG_NOTICE, "strcopystr = %d\n", copyres);
+//
+//			struct sip_armtel_subs *sub;
+//			AST_LIST_TRAVERSE_SAFE_BEGIN(&peer->armtel_event.armtel_subs, sub, nextsub) {
+//				struct sip_pvt *sip_pvt_ptr = NULL;
+//				struct sip_pvt tmp_dialog = {
+//					.callid = sub->callid,
+//				};
+//				sip_pvt_ptr = ao2_t_find(dialogs, &tmp_dialog, OBJ_POINTER, "ao2_find in dialogs");
+//				if (!sip_pvt_ptr) {
+//					ast_log(LOG_NOTICE, "no related call %s:(\n", sub->name);
+//					AST_LIST_REMOVE_CURRENT(nextsub);
+//					destroy_armtel_subscriber(sub);
+//					continue;
+//				}
+//				sip_pvt_ptr->ocseq = reqseqno;
+//				/*int local*/res = transmit_notify_with_armtel(sip_pvt_ptr, buf, 1+sip_pvt_ptr->icseq);
+////				sip_pvt_ptr->ocseq = sip_pvt_ptr->icseq;
+////				sip_pvt_ptr->icseq = reqseqno;
+////				/*int local*/res = transmit_notify_with_armtel(sip_pvt_ptr, buf, sip_pvt_ptr->ocseq);
+//				ast_log(LOG_NOTICE, "transmited STATUS notify with %d to cid %s\n" ,/*local*/res, sip_pvt_ptr->callid);
+//			}
+//			AST_LIST_TRAVERSE_SAFE_END;
+//			if (AST_LIST_EMPTY(&peer->armtel_event.armtel_subs)) {
+//				ast_log(LOG_NOTICE, "list empty, dropping to unset\n");
+//				peer->armtel_event.armtel_type = AE_UNSET;
+//			} else {
+//				ast_log(LOG_NOTICE, "list not empty\n");
+//			}
+//
+//		} break;
+//		}
+//
+//
+////		char buf[200];
+////		if (resp == 200) {
+////			add_peer_armtel_subscriber(peer, peer->call->exten);
+////			snprintf(buf, sizeof(buf), "%d OK", resp);
+////		} else {
+////			snprintf(buf, sizeof(buf), "%d (peer response)", resp);
+////			pvt_set_needdestroy(p, "peer rejected subscribe");
+////		}
+////		transmit_request(peer->call, SIP_NOTIFY, peer->call->ocseq, XMIT_UNRELIABLE, FALSE);
+//		//dialog_unref(peer->call, "request notify unref call");
+//		peer =  sip_unref_peer(peer, "request notify unref peer");
+//		// answer ok to notifier immediately
+//		if (res >= 0)
+//			transmit_response(p, "200 OK", req);
+//		//return;
+
+		if (res >= 0)
+			transmit_response(p, "200 OK", req);
+		res = 0;
 	} else {
 		/* We don't understand this event. */
 		transmit_response(p, "489 Bad event", req);
@@ -25149,6 +26895,139 @@ static int sip_t38_abort(const void *data)
 	return 0;
 }
 
+// AICS transmit update
+void aics_transmit_update(struct sip_pvt *src_pvt, struct sip_request *src_req, struct sip_pvt *target_pvt, char *from, char *to)
+{
+//	// Sequence Number Shamanic
+//	const char * reqcseq = sip_get_header(src_req, "CSeq");
+//	//ast_log(LOG_NOTICE, "src_pvt '%d' cp '%d' r '%s' pi '%s' cpi '%s'\n", src_pvt->ocseq, target_pvt->ocseq, reqcseq, sip_get_header(&(src_pvt->initreq), "CSeq"), sip_get_header(&(target_pvt->initreq), "CSeq"));
+//	//ast_log(LOG_NOTICE, "i: src_pvt '%d' cp '%d'\n", src_pvt->icseq, target_pvt->icseq);
+//	uint32_t seqno;
+//	if (sscanf(sip_get_header(&(target_pvt->initreq), "CSeq"), "%30u ", &seqno) != 1) {
+//		ast_log(LOG_WARNING, "Unable to get seqno from initreq '%s'\n", sip_get_header(&(target_pvt->initreq), "CSeq"));
+//		return;
+//	}
+//	uint32_t seqshift = 1;
+//	if (src_pvt->aics_local.pendingupdate > seqno)
+//		seqshift += src_pvt->aics_local.pendingupdate - seqno;
+//	seqno += seqshift;
+//	target_pvt->ocseq = seqno;
+//
+//	uint32_t reqseqno;
+//	if (sscanf(sip_get_header(src_req, "CSeq"), "%30u ", &reqseqno) != 1) {
+//		ast_log(LOG_WARNING, "Unable to get seqno from src_req '%s'\n", sip_get_header(src_req, "CSeq"));
+//		return;
+//	}
+//	target_pvt->aics_local.pendingupdate = reqseqno;
+//	src_pvt->aics_local.pendingupdate = seqno;
+//
+//
+//	struct sip_request newreq;
+//	ast_set_flag(&target_pvt->flags[1], SIP_PAGE2_IGNORESDPVERSION);
+//	//int sdpproc = -1, sdpfound = find_sdp(src_req);
+//	if (find_sdp(src_req)) {
+//		/*sdpproc =*/ process_sdp(src_pvt, src_req, SDP_T38_NONE);
+//		aics_pvt_addons_set_direction(&target_pvt->aics_addons, src_pvt->aics_addons.direction);//target_pvt->aics_addons.direction = src_pvt->aics_addons.direction;
+//		//ast_string_field_set(target_pvt, ipn20_sdp_a, src_pvt->ipn20_sdp_a); /* Refresh sdp_a in pvt */
+//	}
+//
+///*	if (ggscontrol) {
+//		ast_string_field_set(src_pvt, fromuser, name);
+//		ast_clear_flag(&target_pvt->flags[0], SIP_OUTGOING);
+//		ast_set_flag(&src_pvt->flags[0], SIP_OUTGOING);
+//	}*/
+//	//ast_clear_flag(&target_pvt->flags[0], SIP_OUTGOING);
+//	//reqprep(&newreq, target_pvt, SIP_UPDATE, seqno, 1);
+//	//---
+//	//struct sip_request *orig = &target_pvt->initreq;
+//	char stripped[80];
+//	char tmp[80];
+//	const char *c;
+//	int is_strict = FALSE;		/*!< Strict routing flag */
+//	int is_outbound = ast_test_flag(&target_pvt->flags[0], SIP_OUTGOING);	/* Session direction */
+//	snprintf(target_pvt->lastmsg, sizeof(target_pvt->lastmsg), "Tx: %s", sip_methods[SIP_UPDATE].text);
+//	target_pvt->branch ^= ast_random();
+//	build_via(target_pvt);
+//	/* Check for strict or loose router */
+//	if (target_pvt->route && !ast_strlen_zero(target_pvt->route->hop) && strstr(target_pvt->route->hop, ";lr") == NULL) {
+//		is_strict = TRUE;
+//		if (sipdebug)
+//			ast_debug(1, "Strict routing enforced for session %s\n", target_pvt->callid);
+//	}
+//
+//	if (!ast_strlen_zero(target_pvt->okcontacturi))
+//		c = is_strict ? target_pvt->route->hop : target_pvt->okcontacturi; /* Use for BYE or REINVITE */
+//	else if (!ast_strlen_zero(target_pvt->uri))
+//		c = target_pvt->uri;
+//	else {
+//		char *n;
+//		/* We have no URI, use To: or From:  header as URI (depending on direction) */
+//		ast_copy_string(stripped, sip_get_header(&target_pvt->initreq, is_outbound ? "To" : "From"),
+//				sizeof(stripped));
+//		n = get_in_brackets(stripped);
+//		c = remove_uri_parameters(n);
+//	}
+//	init_req(&newreq, SIP_UPDATE, c);
+//	snprintf(tmp, sizeof(tmp), "%u %s", seqno, sip_methods[SIP_UPDATE].text);
+//	add_header(&newreq, "Via", target_pvt->via);
+//	/*
+//	 * Use the learned route set unless this is a CANCEL on an ACK for a non-2xx
+//	 * final response. For a CANCEL or ACK, we have to send to the same destination
+//	 * as the original INVITE.
+//	 */
+//	if (target_pvt->route) {
+//		if (target_pvt->socket.type != AST_TRANSPORT_UDP && target_pvt->socket.tcptls_session) {
+//			/* For TCP/TLS sockets that are connected we won't need
+//			 * to do any hostname/IP lookups */
+//		} else if (ast_test_flag(&target_pvt->flags[0], SIP_NAT_FORCE_RPORT)) {
+//			/* For NATed traffic, we ignore the contact/route and
+//			 * simply send to the received-from address. No need
+//			 * for lookups. */
+//		} else {
+//			set_destination(target_pvt, target_pvt->route->hop);
+//		}
+//		add_route(&newreq, is_strict ? target_pvt->route->next : target_pvt->route);
+//	}
+//	add_max_forwards(target_pvt, &newreq);
+//
+//	add_header(&newreq, "From", from);
+//	add_header(&newreq, "To", to);
+//
+//	add_header(&newreq, "Contact", target_pvt->our_contact);
+//	copy_header(&newreq, &target_pvt->initreq, "Call-ID");
+//	add_header(&newreq, "CSeq", tmp);
+//	//if (!ast_strlen_zero(global_useragent))
+//		add_header(&newreq, "User-Agent", global_ipn20UA);
+//	if (!ast_strlen_zero(target_pvt->url)) {
+//		add_header(&newreq, "Access-URL", target_pvt->url);
+//		ast_string_field_set(target_pvt, url, NULL);
+//	}
+////		add_header(&newreq, "Min-SE", sip_get_header(src_req, "Min-SE"));
+////		add_header(&newreq, "Session-Expires", sip_get_header(src_req, "Session-Expires"));
+//	copy_header(&newreq, src_req, "Min-SE");
+//	copy_header(&newreq, src_req, "Session-Expires");
+//	add_header(&newreq, "Allow", ALLOWED_METHODS);
+//	add_supported(target_pvt, &newreq);
+////		if (ast_test_flag(&target_pvt->flags[0], SIP_SENDRPID))
+////			add_rpid(&newreq, target_pvt);
+//	if (target_pvt->do_history) {
+//		append_history(target_pvt, "Update", "Update sent");
+//	}
+//	offered_media_list_destroy(target_pvt);
+//	try_suggested_sip_codec(target_pvt);
+//	//ast_set_flag(&target_pvt->flags[0], SIP_OUTGOING);       /* Change direction of this dialog */
+//	target_pvt->ongoing_reinvite = 1;
+//	if (target_pvt->t38.state == T38_DISABLED || target_pvt->t38.state == T38_REJECTED) {
+//		add_sdp(&newreq, target_pvt, FALSE, TRUE, FALSE);
+//		//ast_queue_control(target_pvt->owner, AST_CONTROL_UPDATE_RTP_PEER);
+//	} else {
+//		add_sdp(&newreq, target_pvt, FALSE, TRUE, TRUE);
+//		//ast_queue_frame(target_pvt->owner, &ast_null_frame);
+//	}
+//	snprintf(src_pvt->via, sizeof(src_pvt->via), "%s", sip_get_header(src_req, "Via")); /* !!! remember branch */
+//	send_request(target_pvt, &newreq, XMIT_CRITICAL, seqno);
+}
+
 /*!
  * \brief bare-bones support for SIP UPDATE
  *
@@ -25162,6 +27041,260 @@ static int sip_t38_abort(const void *data)
  */
 static int handle_request_update(struct sip_pvt *p, struct sip_request *req)
 {
+	/* AICS fully new support for UPDATE method */
+//	struct ast_channel *c=NULL;
+	int res = 0;
+	//uint32_t seqno;
+//	const char *required;
+	RAII_VAR(struct ast_channel *, peer_channel, NULL, ast_channel_cleanup);
+//	char quality_buf[AST_MAX_USER_FIELD], *quality;
+//
+//	/* If we have an INCOMING invite that we haven't answered, terminate that transaction */
+//	if (p->pendinginvite && !ast_test_flag(&p->flags[0], SIP_OUTGOING) && !req->ignore) {
+//		transmit_response_reliable(p, "487 Request Terminated", &p->initreq);
+//	}
+//
+//	__sip_pretend_ack(p);
+
+//	p->invitestate = INV_TERMINATED;
+
+	copy_request(&p->initreq, req);
+	if (sipdebug)
+		ast_debug(1, "Initializing initreq for method %s - callid %s\n", sip_methods[req->method].text, p->callid);
+	check_via(p, req);
+
+
+	if (p->owner) {
+		RAII_VAR(struct ast_channel *, owner_relock, NULL, ast_channel_cleanup);
+		RAII_VAR(struct ast_channel *, owner_ref, NULL, ast_channel_cleanup);
+
+		/* Grab a reference to p->owner to prevent it from going away */
+		owner_ref = ast_channel_ref(p->owner);
+		ast_log(LOG_NOTICE, "aics_proxy_params_copy(ast_channel_proxy(owner_ref), &p->aics_proxy);\n");
+		aics_proxy_params_copy(ast_channel_proxy(owner_ref), &p->aics_proxy);
+
+		/* Established locking order here is bridge, channel, pvt
+		 * and the bridge will be locked during ast_channel_bridge_peer */
+		ast_channel_unlock(owner_ref);
+		sip_pvt_unlock(p);
+
+		peer_channel = ast_channel_bridge_peer(owner_ref);
+		//ast_log(LOG_NOTICE, "aics_proxy_params_copy(ast_channel_proxy(peer_channel), ast_channel_proxy(owner_ref));\n");
+		aics_proxy_params_copy(ast_channel_proxy(peer_channel), ast_channel_proxy(owner_ref));
+
+		owner_relock = sip_pvt_lock_full(p);
+		if (!owner_relock) {
+			ast_debug(3, "Unable to reacquire owner channel lock, channel is gone\n");
+			return 0;
+		}
+	}
+
+	if (peer_channel) {
+		ast_channel_lock(peer_channel);
+		if (IS_SIP_TECH(ast_channel_tech(peer_channel))) {
+			struct sip_pvt *peer_pvt;
+
+			peer_pvt = ast_channel_tech_pvt(peer_channel);
+			if (peer_pvt) {
+				ao2_ref(peer_pvt, +1);
+				sip_pvt_lock(peer_pvt);
+				//(LOG_NOTICE, "aics_proxy_params_copy(&peer_pvt->aics_proxy, ast_channel_proxy(peer_channel));\n");
+				aics_proxy_params_copy(&peer_pvt->aics_proxy, ast_channel_proxy(peer_channel));
+				//ast_log(LOG_NOTICE, "src %s ocseq %d icseq %d \n", (ast_test_flag(&p->flags[0], SIP_OUTGOING) ? "out":"in"), p->ocseq, p->icseq);
+				//ast_log(LOG_NOTICE, "dst %s ocseq %d icseq %d \n", (ast_test_flag(&peer_pvt->flags[0], SIP_OUTGOING) ? "out":"in"), peer_pvt->ocseq, peer_pvt->icseq);
+				//ast_clear_flag(&p->flags[0], SIP_OUTGOING);
+				//ast_set_flag(&peer_pvt->flags[0], SIP_OUTGOING);
+				//if (sscanf(sip_get_header(&req, "CSeq"), "%30u ", &seqno) == 1) {
+				//	p->aics_local.pendingupdate = seqno;
+				//}
+				p->aics_local.pendingupdate = p->icseq;
+				res = transmit_invite(peer_pvt, SIP_UPDATE, 1, 0, NULL);
+				//ast_log(LOG_NOTICE, "xmit res %d\n", res);
+				sip_pvt_unlock(peer_pvt);
+				ao2_ref(peer_pvt, -1);
+			}
+		}
+		ast_channel_unlock(peer_channel);
+	}
+	return res;
+	/*
+	if (!strcasecmp(p->useragent, global_ipn20UA) && p->owner) {
+		struct ast_var_t *var;
+		struct aics_channel_addons *this_addons = ast_channel_addons(p->owner);
+		////char *target_name = (this_addons->ctrlchan ? this_addons->ctrlchan : NULL);
+		struct ast_channel *target_chan = NULL;
+		struct sip_pvt *target_pvt = NULL;
+
+		char newto[256];
+		char fromtag[128];
+		char totag[128];
+		const char *ot, *of;
+		char *bridge_list = NULL;
+
+		switch (this_addons->scenario) {
+//		case AICS_SCENARIO_CONFERENCE:
+//
+//			break;
+		case AICS_SCENARIO_SELECTOR:
+		case AICS_SCENARIO_CIRCULAR:
+			if (!target_name) {
+				//ast_channel_lock(p->owner);
+				aics_addons_notice(ast_channel_addons(p->owner), "Request Update on channel");
+				AST_LIST_TRAVERSE(ast_channel_varshead(p->owner), var, entries) {
+					//ast_log(LOG_NOTICE, "%s=%s\n", ast_var_name(var), ast_var_value(var));
+					if (!strcasecmp(ast_var_name(var), "AICSORIGINATE_CHANNEL")) {
+						target_name = ast_strdupa(ast_var_value(var));
+						break;
+					}
+				}
+				//ast_channel_unlock(p->owner);
+				//ast_channel_unref(p->owner);
+			}
+			if (!target_name) {
+				ast_log(LOG_ERROR, "Channel 'AICSORIGINATE_CHANNEL' empty\n");
+				return 0;
+			}
+			target_chan = ast_channel_get_by_name(target_name);
+			if (!target_chan) {
+				ast_log(LOG_ERROR, "Channel '%s' not found\n", target_name);
+				return 0;
+			}
+			aics_addons_notice(ast_channel_addons(target_chan), "Request Update target");
+			if (this_addons->scenario == AICS_SCENARIO_CIRCULAR) {
+				AST_LIST_TRAVERSE(ast_channel_varshead(target_chan), var, entries) {
+					//ast_log(LOG_NOTICE, "%s=%s\n", ast_var_name(var), ast_var_value(var));
+					if (!strcasecmp(ast_var_name(var), "BRIDGEPEER")) {
+						bridge_list = ast_strdupa(ast_var_value(var));
+						break;
+					}
+				}
+			}
+
+			target_pvt = ast_channel_tech_pvt(target_chan);
+			if (!target_pvt) {
+				ast_log(LOG_ERROR, "SIP_PVT not found in channel '%s'\n", target_name);
+				return 0;
+			}
+
+			ot = sip_get_header(&target_pvt->initreq, "To");
+			of = sip_get_header(&target_pvt->initreq, "From");
+			gettag(&target_pvt->initreq, "To", totag, sizeof(totag));
+			gettag(&target_pvt->initreq, "From", fromtag, sizeof(fromtag));
+			//ast_log(LOG_NOTICE, "from '%s' to '%s' tag '%s' theirtag '%s'\n", of, ot, target_pvt->tag, target_pvt->theirtag);
+			if (!strcasestr(ot, "tag=")) {
+				snprintf(newto, sizeof(newto), "%s;tag=%s", ot, target_pvt->theirtag);
+				ot = newto;
+			}
+			//ast_log(LOG_NOTICE,"p before ocseq %d pendupd %d\n",p->ocseq,p->pendingupdate);
+			//ast_log(LOG_NOTICE,"target before ocseq %d pendupd %d\n",target_pvt->ocseq,target_pvt->pendingupdate);
+
+			aics_transmit_update(p, req, target_pvt, of, ot);
+			aics_pvt_addons_copy(&ast_channel_addons(target_chan)->pvt_addons, &target_pvt->aics_addons);
+
+			//ast_log(LOG_NOTICE,"p after ocseq %d pendupd %d\n",p->ocseq,p->pendingupdate);
+			//ast_log(LOG_NOTICE,"target after ocseq %d pendupd %d\n",target_pvt->ocseq,target_pvt->pendingupdate);
+
+			//transmit_invite(target_pvt, SIP_UPDATE, 1, 1, NULL);
+
+			// this works only at circular
+			if (bridge_list) {
+				char *saveptr, *chan_name;
+				int counter = 0;
+				for (chan_name = strtok_r(bridge_list, ",", &saveptr); chan_name; chan_name = strtok_r(NULL, ",", &saveptr)) {
+					//ast_log(LOG_NOTICE, "%d=%s\n", counter, chan_name);
+					if (counter) {
+						struct ast_channel *bridge_chan = ast_channel_get_by_name(chan_name);
+						if (!bridge_chan)
+							continue;
+						struct sip_pvt *bridge_pvt = ast_channel_tech_pvt(bridge_chan);
+						if (!bridge_pvt)
+							continue;
+						if (bridge_pvt->aics_addons.direction != AICS_DIRECTION_INACTIVE)
+							aics_pvt_addons_set_direction(&bridge_pvt->aics_addons, AICS_DIRECTION_INACTIVE);//bridge_pvt->aics_addons.direction = AICS_DIRECTION_INACTIVE;
+						else
+							aics_pvt_addons_set_direction(&bridge_pvt->aics_addons, AICS_DIRECTION_SENDONLY);//bridge_pvt->aics_addons.direction = AICS_DIRECTION_SENDONLY;
+						aics_pvt_addons_copy(&ast_channel_addons(bridge_chan)->pvt_addons, &bridge_pvt->aics_addons);
+
+//						ot = sip_get_header(&bridge_pvt->initreq, "To");
+//						of = sip_get_header(&bridge_pvt->initreq, "From");
+//						gettag(&bridge_pvt->initreq, "To", totag, sizeof(totag));
+//						gettag(&bridge_pvt->initreq, "From", fromtag, sizeof(fromtag));
+//						ast_log(LOG_NOTICE, "from '%s' to '%s' tag '%s' theirtag '%s'\n", of, ot, bridge_pvt->tag, bridge_pvt->theirtag);
+//						if (!strcasestr(ot, "tag=")) {
+//							snprintf(newto, sizeof(newto), "%s;tag=%s", ot, bridge_pvt->theirtag);
+//							ot = newto;
+//						}
+//						aics_transmit_update(p, req, bridge_pvt, of, ot);
+
+						//bridge_pvt->ocseq++;
+						//ast_log(LOG_NOTICE,"br before ocseq %d pendupd %d\n",bridge_pvt->ocseq,bridge_pvt->pendingupdate);
+						transmit_invite(bridge_pvt, SIP_UPDATE, 1, 1, NULL);
+						//bridge_pvt->pendingupdate = bridge_pvt->ocseq;
+						//ast_log(LOG_NOTICE,"br after ocseq %d pendupd %d\n",bridge_pvt->ocseq,bridge_pvt->pendingupdate);
+					}
+					counter++;
+				}
+			}
+			break;
+		default:
+			if (!target_name) {
+				//ast_channel_lock(p->owner);
+				aics_addons_notice(ast_channel_addons(p->owner), "Request Update on channel");
+				AST_LIST_TRAVERSE(ast_channel_varshead(p->owner), var, entries) {
+					//ast_log(LOG_NOTICE, "%s=%s\n", ast_var_name(var), ast_var_value(var));
+					if (!strcasecmp(ast_var_name(var), "DIALEDPEERNAME")) {
+						target_name = ast_strdupa(ast_var_value(var));
+						break;
+					}
+				}
+				//ast_channel_unlock(p->owner);
+				//ast_channel_unref(p->owner);
+			}
+			if (!target_name) {
+				ast_log(LOG_ERROR, "Channel 'DIALEDPEERNAME' empty\n");
+				return 0;
+			}
+			target_chan = ast_channel_get_by_name(target_name);
+			if (!target_chan) {
+				ast_log(LOG_ERROR, "Channel '%s' not found\n", target_name);
+				return 0;
+			}
+			target_pvt = ast_channel_tech_pvt(target_chan);
+			if (!target_pvt) {
+				ast_log(LOG_ERROR, "SIP_PVT not found in channel '%s'\n", target_name);
+				return 0;
+			}
+
+			ot = sip_get_header(&target_pvt->initreq, "To");
+			of = sip_get_header(&target_pvt->initreq, "From");
+			gettag(&target_pvt->initreq, "To", totag, sizeof(totag));
+			gettag(&target_pvt->initreq, "From", fromtag, sizeof(fromtag));
+			//ast_log(LOG_NOTICE, "from '%s' to '%s' tag '%s' theirtag '%s'\n", of, ot, target_pvt->tag, target_pvt->theirtag);
+			if (!strcasestr(ot, "tag=")) {
+				snprintf(newto, sizeof(newto), "%s;tag=%s", ot, target_pvt->tag);
+				ot = newto;
+			}
+			aics_transmit_update(p, req, target_pvt, ot, of);
+		}
+
+		return 0;
+
+
+//		struct ast_channel_iterator *it_chans = NULL;
+//		if (!(it_chans = ast_channel_iterator_all_new()))
+//			return -1;
+//		for (; it_chans && (target_chan = ast_channel_iterator_next(it_chans)); ast_channel_unref(target_chan)) {
+//				ast_channel_lock(target_chan);
+//				ast_log(LOG_NOTICE, "Requested Update on channel '%s'\n", ast_channel_name(target_chan));
+//				target_pvt = ast_channel_tech_pvt(target_chan);
+//				ast_channel_unlock(target_chan);
+//		}
+//		ast_channel_iterator_destroy(it_chans);
+
+	}
+	/* ~AICS */
+
+
 	if (ast_strlen_zero(sip_get_header(req, "X-Asterisk-rpid-update"))) {
 		transmit_response(p, "501 Method Not Implemented", req);
 		return 0;
@@ -25368,6 +27501,10 @@ static int handle_request_invite(struct sip_pvt *p, struct sip_request *req, str
 	};
 	RAII_VAR(struct sip_pvt *, replaces_pvt, NULL, ao2_cleanup);
 	RAII_VAR(struct ast_channel *, replaces_chan, NULL, ao2_cleanup);
+
+//const char * reqcseq = sip_get_header(req, "CSeq");
+//ast_log(LOG_NOTICE, "p '%d' r '%s' s '%d'\n", p->ocseq, reqcseq, seqno);
+ // ast_log(LOG_WARNING, "Req1 con=%s;ext=%s;cid=%s;\n",p->context,p->exten,p->cid_num);
 
 	/* Find out what they support */
 	if (!p->sipoptions) {
@@ -26594,7 +28731,7 @@ static int handle_request_cancel(struct sip_pvt *p, struct sip_request *req)
 		transmit_response(p, "200 OK", req);
 		return 1;
 	} else {
-		transmit_response(p, "481 Call Leg Does Not Exist", req);
+		transmit_response(p, "481 Call Leg Does Not Exist (Cancel)", req);
 		return 0;
 	}
 }
@@ -26819,9 +28956,37 @@ static int handle_request_message(struct sip_pvt *p, struct sip_request *req, st
 	if (!req->ignore) {
 		if (req->debug)
 			ast_verbose("Receiving message!\n");
+            int start=0;
+            unsigned char cmd,context,prio;
+			char *sign=__get_header(req,H_ARMTEL_SIGN,&start);
+            if(get_armtel_sign(sign,&cmd,&context,&prio)){
+              switch(cmd){
+		          case AICS_ARMTEL_ASK_WORD:
+				    aics_send_armtel_sign(p->owner,AICS_ARMTEL_ASK_WORD,prio,context);
+			       ast_log(LOG_WARNING, "(%s)ASK_WORD context=%d;prio=%d\n",ast_channel_name(p->owner),context,prio);
+			      break;
+		          case AICS_ARMTEL_REMOVE_WORD:
+			       aics_send_armtel_sign(p->owner,AICS_ARMTEL_REMOVE_WORD,0,context);
+			       ast_log(LOG_WARNING, "(%s)REMOVE_WORD context=%d\n",ast_channel_name(p->owner),context);
+			      break;
+		          case AICS_ARMTEL_INTERRUPT_WORD:
+			      break;
+		          case AICS_ARMTEL_DIRECTION:
+			       aics_send_armtel_sign(p->owner,AICS_ARMTEL_DIRECTION,0,context);
+			        ast_log(LOG_WARNING, "(%s)DIRECTION context=%d \n",ast_channel_name(p->owner),context);
+			      break;
+		          case AICS_ARMTEL_DISKRET3:
+			        break;
+		          case AICS_ARMTEL_CHANGE_STATE_CONF:
+			      break;
+		      }
+            }
+
 		receive_message(p, req, addr, e);
 	} else
+    {
 		transmit_response(p, "202 Accepted", req);
+	}
 	return 1;
 }
 
@@ -26885,6 +29050,8 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 	struct ast_msg_var_iterator *iter;
 	struct sip_peer *peer_ptr;
 
+	//ast_log(LOG_NOTICE, "ast_msg ref %p\n", msg);
+
 	if (!(pvt = sip_alloc(NULL, NULL, 0, SIP_MESSAGE, NULL, NULL))) {
 		return -1;
 	}
@@ -26892,6 +29059,7 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 	for (iter = ast_msg_var_iterator_init(msg);
 		ast_msg_var_iterator_next(msg, iter, &var, &val);
 		ast_msg_var_unref_current(iter)) {
+		//ast_log(LOG_NOTICE, "Iter %s %s\n", var, val);
 		if (!strcasecmp(var, "Request-URI")) {
 			ast_string_field_set(pvt, fullcontact, val);
 			break;
@@ -26925,7 +29093,8 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 				/* This can occur if either
 				 *  1) A name-addr style From header does not close the angle brackets
 				 *  properly.
-				 *  2) The From header is not in name-addr style and the content of the
+				 *  2) The Fr
+				 *  om header is not in name-addr style and the content of the
 				 *  From contains characters other than 0-9, *, #, or +.
 				 *
 				 *  In both cases, ast_callerid_parse() should have parsed the From header
@@ -26951,7 +29120,7 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 			ast_string_field_set(pvt, fromname, from);
 		}
 	}
-
+//ast_log(LOG_NOTICE, "fromuser is %s\n", pvt->fromuser);
 	sip_pvt_lock(pvt);
 
 	/* Look up the host to contact */
@@ -26975,6 +29144,7 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 	for (iter = ast_msg_var_iterator_init(msg);
 		ast_msg_var_iterator_next(msg, iter, &var, &val);
 		ast_msg_var_unref_current(iter)) {
+		//ast_log(LOG_NOTICE, "Iter header %s %s\n", var, val);
 		if (!strcasecmp(var, "Max-Forwards")) {
 			/* Decrement Max-Forwards for SIP loop prevention. */
 			if (sscanf(val, "%30d", &pvt->maxforwards) != 1 || pvt->maxforwards < 1) {
@@ -26990,14 +29160,23 @@ static int sip_msg_send(const struct ast_msg *msg, const char *to, const char *f
 			continue;
 		}
 		if (block_msg_header(var)) {
+			//ast_log(LOG_NOTICE, "Blocked header %s %s\n", var, val);
 			/* Block addition of this header. */
 			continue;
 		}
+		//ast_log(LOG_NOTICE, "Added header %s %s\n", var, val);
 		add_msg_header(pvt, var, val);
 	}
 	ast_msg_var_iterator_destroy(iter);
+	aics_relay_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_ARMTEL_RELAY));
+	aics_event_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_ARMTEL_EVENT));
+	aics_scenario_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_ARMTEL_SCENARIO));
+	aics_playlist_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_ARMTEL_PLAYLIST));
+	aics_priority_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_PRIORITY));
+	aics_direction_set(&pvt->aics_proxy, ast_msg_get_var(msg, H_ARMTEL_DIRECTION));
 
 	ast_string_field_set(pvt, msg_body, ast_msg_get_body(msg));
+	//ast_log(LOG_NOTICE, "Transmitting message [%s] it has relay %s\n", ast_msg_get_body(msg), ast_msg_get_var(msg, H_ARMTEL_RELAY));
 	res = transmit_message(pvt, 1, 0);
 
 	sip_pvt_unlock(pvt);
@@ -27683,7 +29862,6 @@ static int handle_request_subscribe(struct sip_pvt *p, struct sip_request *req, 
 	if (ast_strlen_zero(p->tag)) {
 		make_our_tag(p);
 	}
-
 	if (!strcmp(event, "presence") || !strcmp(event, "dialog")) { /* Presence, RFC 3842 */
 		int gotdest;
 		const char *accept;
@@ -27691,8 +29869,8 @@ static int handle_request_subscribe(struct sip_pvt *p, struct sip_request *req, 
 		enum subscriptiontype subscribed = NONE;
 		const char *unknown_accept = NULL;
 
-                /* Get destination right away */
-                gotdest = get_destination(p, NULL, NULL);
+        /* Get destination right away */
+        gotdest = get_destination(p, NULL, NULL);
 		if (gotdest != SIP_GET_DEST_EXTEN_FOUND) {
 			if (gotdest == SIP_GET_DEST_INVALID_URI) {
 				transmit_response(p, "416 Unsupported URI scheme", req);
@@ -27844,6 +30022,60 @@ static int handle_request_subscribe(struct sip_pvt *p, struct sip_request *req, 
 		/* Do not release authpeer here */
 	} else if (!strcmp(event, "call-completion")) {
 		handle_cc_subscribe(p, req);
+
+	} else if (!strcmp(event, "armtel")) { /* AICS armtel event package */
+		int gotdest;
+		int start = 0;
+		int found_supported = 0;
+		const char *accept;
+
+		/* Get destination right away */
+		ast_log(LOG_NOTICE, "armtel event s p.exten before %s\n", p->exten);
+		gotdest = get_destination(p, NULL, NULL);
+		ast_log(LOG_NOTICE, "armtel event s p.exten after %s getdest %d\n", p->exten, gotdest);
+		if (gotdest != SIP_GET_DEST_EXTEN_FOUND) {
+			if (gotdest == SIP_GET_DEST_INVALID_URI) {
+				transmit_response(p, "416 Unsupported URI scheme", req);
+			} else {
+				transmit_response(p, "404 Not Found", req);
+			}
+			pvt_set_needdestroy(p, "subscription target not found");
+			if (authpeer) {
+				sip_unref_peer(authpeer, "sip_unref_peer, from handle_request_subscribe (authpeer 2)");
+			}
+			return 0;
+		}
+		accept = __get_header(req, "Accept", &start);
+		while (!found_supported && !ast_strlen_zero(accept)) {
+			found_supported = strcmp(accept, "application/aidf+xml") ? 0 : 1;
+			if (!found_supported) {
+				ast_debug(3, "Received SIP armtel subscription for unknown format: %s\n", accept);
+			}
+			accept = __get_header(req, "Accept", &start);
+		}
+		/* If !start, there is no Accept header at all */
+		if (start && !found_supported) {
+			/* Format requested that we do not support */
+			transmit_response(p, "406 Not Acceptable", req);
+			ast_debug(2, "Received SIP armtel subscription for unknown format: %s\n", accept);
+			pvt_set_needdestroy(p, "unknown format");
+			if (authpeer) {
+				sip_unref_peer(authpeer, "sip_unref_peer, from handle_request_subscribe (authpeer 3)");
+			}
+			return 0;
+		}
+		ast_log(LOG_NOTICE, "aidf_xml accepted and supported\n");
+		p->subscribed = AIDF_XML;
+
+		if (authpeer) {
+			if (p->relatedpeer != authpeer) {
+				if (p->relatedpeer) {
+					sip_unref_peer(p->relatedpeer, "Unref previously stored relatedpeer ptr");
+				}
+				p->relatedpeer = sip_ref_peer(authpeer, "setting dialog's relatedpeer pointer");
+			}
+		}
+		/* Do not release authpeer here */
 	} else { /* At this point, Asterisk does not understand the specified event */
 		transmit_response(p, "489 Bad Event", req);
 		ast_debug(2, "Received SIP subscribe for unknown event package: %s\n", event);
@@ -27903,6 +30135,92 @@ static int handle_request_subscribe(struct sip_pvt *p, struct sip_request *req, 
 				ao2_lock(p);
 				sip_unref_peer(peer, "release a peer ref now that MWI is sent");
 			}
+		} else if (p->subscribed == AIDF_XML) {
+/* AICS armtel event subscription  */
+
+			struct ae_provider ae_tmp_prov;// = { 0, };
+			struct ae_provider *ae_pprov = &ae_tmp_prov;
+			enum AE_MATCH_RESULT ae_match = ae_find_provider(p->exten, NULL, &ae_pprov);
+
+			if (ae_match == AE_MATCH_NONE) {
+//				struct ast_str str_body;
+//				struct ast_str* pstr_body = &str_body;
+//				ast_str_append(&pstr_body, 0, AE_MOCK_BODY);
+//				ae_ptr = ae_alloc(p->exten, NULL, &str_body);
+				ae_pprov = ae_alloc(p->exten, NULL, sip_get_header(req, "To"));
+				if (ae_pprov) {
+
+				} else {
+					ast_log(LOG_WARNING, "Failed to add Armtel event provider\n");
+					return 0;
+				}
+			} else {
+				//ae_destroy(ae_pprov);
+			}
+
+			struct ae_subscriber ae_tmp_sub;// = { 0, };
+			struct ae_subscriber *ae_psub = &ae_tmp_sub;
+			ae_match = ae_find_subscriber(ae_pprov, p->peername, p->callid, &ae_psub);
+			if (ae_match == AE_MATCH_NONE) {
+				if (ae_add_subscriber(ae_pprov, p->peername, p->callid)) {
+
+				} else {
+					ast_log(LOG_WARNING, "Failed to add Armtel event subscriber\n");
+					return 0;
+				}
+			} else if (ae_match == AE_MATCH_NAME) {
+				ast_log(LOG_NOTICE, "Refreshing subscriber callid\n");
+				ae_update_subscriber_callid(ae_psub, p->callid);
+				//ast_copy_string(ae_psub->callid, p->callid, sizeof(ae_psub->callid));
+			}
+
+			transmit_response(p, "200 OK", req);
+//			ast_log(LOG_NOTICE, "Provider callid [%s] is zero %d\n",ae_pprov->callid,ast_strlen_zero(ae_pprov->callid));
+//			ast_log(LOG_NOTICE, "subscriber callid [%s] is zero %d\n",p->callid,ast_strlen_zero(p->callid));
+			if (ast_strlen_zero(ae_pprov->callid)) {
+				ast_log(LOG_NOTICE, "Provider has no callid - sending subscribe to provider\n");
+				// trying to send subscribe to provider
+				struct sip_peer *peer2subscribe = sip_find_peer(p->exten, NULL, TRUE, FINDALLDEVICES, FALSE, 0);
+				if (peer2subscribe) {
+					struct sip_pvt *pvt;
+					if (!(pvt = sip_alloc(NULL, NULL, 0, SIP_SUBSCRIBE, NULL, NULL))) {
+						ast_debug(2, "SIP subscribe cannot alloc pvt\n");
+						return 0;
+					}
+					set_socket_transport(&pvt->socket, 0);
+					if (create_addr_from_peer(pvt, peer2subscribe)) {
+						dialog_unlink_all(pvt);
+						dialog_unref(pvt, "unref dialog pvt just created via sip_alloc");
+						ast_debug(2, "SIP subscribe cannot create addr from peer\n");
+						return 0;
+					}
+					ast_sip_ouraddrfor(&pvt->sa, &pvt->ourip, pvt);
+					ast_set_flag(&pvt->flags[1], SIP_PAGE2_DIALOG_ESTABLISHED);
+					pvt->subscribed = p->subscribed;
+					pvt->expiry = p->expiry;
+					if (pvt->expiry > 0)
+						sip_scheddestroy(pvt, (pvt->expiry + 10) * 1000);
+
+					sip_pvt_lock(pvt);
+					/* Send armtel subscription */
+					ast_set_flag(&pvt->flags[0], SIP_OUTGOING);
+					/* the following will decrement the refcount on pvt as it finishes */
+					transmit_invite(pvt, SIP_SUBSCRIBE, 0, 2, NULL);
+					sip_pvt_unlock(pvt);
+					// here we should send notify to subscriber
+					transmit_notify_with_armtel(p, ast_str_buffer(ae_pprov->body.data), seqno+1);
+				} else {
+					ast_log(LOG_NOTICE, "Provider absent\n");
+				}
+
+			} else {
+				ast_log(LOG_NOTICE, "Provider has callid - sending notify to subscriber\n");
+				// here we should send notify to subscriber
+				transmit_notify_with_armtel(p, ast_str_buffer(ae_pprov->body.data), seqno+1);
+			}
+
+			//return 0;
+
 		} else if (p->subscribed != CALL_COMPLETION) {
 			struct state_notify_data data = { 0, };
 			char *subtype = NULL;
@@ -28047,6 +30365,383 @@ static int handle_request_register(struct sip_pvt *p, struct sip_request *req, s
 
 	return res;
 }
+/* AICS support for Armtel headers */
+//-------------------------------------------------------------------------------------------
+// извлечение дополнительной сигнализации armtel
+// вход:     *sign - у-ль на строку сигнализации
+// вход.выход:*cmd - команда
+// вход.выход:*context -контекст
+// выход "0"-неудача
+//-------------------------------------------------------------------------------------------
+int get_armtel_sign(char* sign,unsigned char *cmd,unsigned char *context,unsigned char *prio )
+{
+char *p1,*p2,*p3,*rem;
+
+*prio=0;
+  if(sign){
+     if((p1=strchr(sign,' '))){
+      if((p2=strchr(p1+1,' '))){
+        if((p3=strchr(p2+1,' '))){
+         *p2='\0';
+         *cmd = strtol(p1+1, &rem, 16);
+         *p3='\0';
+         *context= strtol(p2+1, &rem, 16);
+         *prio= strtol(p3+1, &rem, 16);
+         return 1;
+        }
+        else{
+         *p2='\0';
+         *cmd = strtol(p1+1, &rem, 16);
+         *context= strtol(p2+1, &rem, 16);
+         return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+//-------------------------------------------------------------------------------------------
+//отправка дополнительной сигнализации armtel
+// вход:
+//   *p - у-ль на диалог
+//   cmd  - команда
+//   context  -контекст
+//-------------------------------------------------------------------------------------------
+int transmit_message_armtel_sign(struct sip_pvt *p,const char* to,unsigned char cmd, unsigned char context)
+{
+	struct sip_request req;
+    char buf[128];
+   if(to){
+//  	     ast_log(LOG_WARNING, "!!!!--%s--!!!![%d][%d]\n",to,cmd,context);
+		reqprep(&req, p, SIP_MESSAGE, 0, 1);
+		strcpy(buf,to);
+		sprintf(&buf[strlen(to)]," %X %X",cmd,context);
+        add_header_with_value(&req, H_ARMTEL_SIGN, buf);
+		return send_request(p, &req, XMIT_RELIABLE, p->ocseq);
+	}
+	return 0;
+}
+
+//-------------------------------------------------------------------------------------------
+//ищем по набранному номеру(exten)  технологию+ канал в диалплане B app Dial
+// вход:
+//   context  -контекст
+//   exten  - набранный нумер
+//   cid_num  -
+//-------------------------------------------------------------------------------------------
+
+struct ast_exten* find_ext_dial( char* context , char* exten,char* cid_num)
+{
+struct pbx_find_info q={.stacklen=0};
+struct ast_exten *ext=(struct ast_exten*)NULL;
+int prio=1;
+
+  while( (ext= pbx_find_extension(NULL,NULL,&q,context,exten,prio,NULL,cid_num,E_MATCH)) != NULL )
+  {
+
+
+//       ast_log(LOG_WARNING, "%s!!!!!!!!name=%s;app=%s;parent=%s\n",context,ast_get_extension_name(ext),ast_get_extension_app(ext),ast_get_context_name(ast_get_extension_context(ext)));
+       if(ast_get_context_name(ast_get_extension_context(ext)))   strcpy(context,ast_get_context_name(ast_get_extension_context(ext)));
+       if(!strcmp(ast_get_extension_app(ext),"Dial")){
+ //             ast_log(LOG_WARNING, "#### Dial ########\n",ast_get_extension_name(ext),ast_get_extension_app(ext));
+              return ext;
+       }
+       prio ++;
+  }
+
+  return NULL;
+}
+
+//-------------------------------------------------------------------------------------------
+// дополнительная проверка при отправке notify
+//проверяется изменивший состояниие абонент является участником селектора/циркуляра ?
+// и получатель является инициаторм ? ( для индикации исходящего вызова на кнопке)
+// вход:
+//    *p -диалог
+//   *to  -номер получателя
+//   *up  -номер абонента изменившего состояние
+//   state - состояние абонента изменившего состояние
+//-------------------------------------------------------------------------------------------
+int is_notify_outgoing_ind(struct sip_pvt *p,const char* to,const char* up,int state)
+{
+struct ao2_iterator i;
+struct sip_pvt *sp =NULL;
+struct aics_proxy_params *pp;
+struct ast_channel *owner;
+
+    i=ao2_iterator_init(dialogs,0);
+//ищем есть ли диалог инициатора
+    while ((sp=ao2_iterator_next(&i))) {
+//		 if((sp->method == SIP_ACK) && (!strcmp(sp->username,to)) ){
+//         sip_pvt_lock(sp);
+		 if (!strcmp(sp->username,to)) {
+		      owner=sp->owner;
+	          if(owner) {
+                pp=ast_channel_proxy(owner);
+                if((pp)&&((pp->scenario==AICS_SCENARIO_CIRCULAR)||(pp->scenario==AICS_SCENARIO_SELECTOR) ||(pp->scenario==AICS_SCENARIO_GROUP))) {
+                  if(pp->is_member){
+//		             sip_pvt_unlock(sp);
+  			         dialog_unref(sp, "drop ref in iterator loop");
+                     continue;
+                  }
+                  else{
+                      struct pbx_find_info q={.stacklen=0};
+                      struct ast_exten *ext=(struct ast_exten*)NULL;
+                      char buf[80],*p1;
+              // по номеру ищем в плане
+                      ext= find_ext_dial(p->context,up,to);
+                      if(ext){
+               // формируем имя канала
+                            strcpy(buf,ast_get_extension_app_data(ext));
+//                         ast_log(LOG_WARNING, "#### ast_get_extension_app_data(ext)\n",buf);
+                            if((p1=strrchr(buf,'/'))){
+                              *(p1+1)='\0';
+                              strcat(buf,up);
+                              if( (strstr(buf,"DAHDI")) && (p1= strchr(buf,'G')) ){
+                                 *p1='i';
+                              }
+                            }
+                  //ищем  изменивший состояние абонент на связи с инициаторм ?
+                            struct ast_channel *ac=ast_channel_get_by_name_prefix(buf,strlen(buf));
+                            if(ac){
+                               struct ast_party_connected_line *pc =ast_channel_connected(ac);
+                               if(pc && (pc->id.number.str) && (!strcmp(to,pc->id.number.str)) ){
+           	                     ast_log(LOG_NOTICE, "AICS:Update indicate to=[%s] up=[%s] state=[%d]\n",to,up,state);
+//                                 sip_pvt_unlock(sp);
+          			             dialog_unref(sp, "drop ref in iterator loop");
+                                 return 1;
+                                }
+                            }
+                      }
+                   }
+                }//if((pp)&&((pp->scenar....
+              }//if(owner) {...
+           }
+//           sip_pvt_unlock(sp);
+           dialog_unref(sp, "drop ref in iterator loop");
+        }
+     	ao2_iterator_destroy(&i);
+        return 0;
+}
+//-------------------------------------------------------------------------------------------
+//проверка инициатором абонента входящего в группу(bridge)
+// вход:
+//   bc -канал входящий в мост
+//   exten - вызываемый канал
+//   tech - технология
+//-------------------------------------------------------------------------------------------
+int check_member_armtel_group(struct ast_bridge_channel *bc,const char* exten,const char* tech )
+{
+struct ast_channel *ac =bc->chan;
+   if( strstr(ast_channel_name(ac),tech) && strstr(ast_channel_name(ac),exten) ){
+   	      if(bc->features->mute){
+   	      // отбиваем
+ //           ast_log(LOG_NOTICE, "AICS:Delete member=%s ]\n",ast_channel_name(ac));
+   	        ast_softhangup_nolock(ac,AST_SOFTHANGUP_DEV);
+   	        return 1;
+   	      }
+   	      else{
+   	      //переключаем направление разговора
+//   	         ast_log(LOG_WARNING, "---------------CHAN_SPEAK=%s ]\n",ast_channel_name(ac));
+   	         return 2;
+	      }
+   }
+   return 0;
+}
+void armtel_hangup(struct ast_channel* ast)
+{
+      struct aics_proxy_params* pp=ast_channel_proxy(ast);
+
+    	struct aics_dial_item *p;
+	    AST_LIST_TRAVERSE(&pp->armtel_dial.armtel_dial, p, next) {
+
+          struct ast_dial* dial= (struct ast_dial*)p->dial;
+		  ast_dial_join(dial);
+		/* Hangup all channels */
+		   ast_dial_hangup(dial);
+		/* Destroy dialing structure */
+		  ast_dial_destroy(dial);
+      }
+}
+//-------------------------------------------------------------------------------------------
+// ищем в диалплане по запросу инвайт
+// вход:
+//    rec - запрос
+//    contex -контекст
+//выход:
+// exten - номер вызываемого
+// tech - технолoгия
+// cid_num - номер вызывающего
+// ext_full -номер с префиксом  например (G1/200) из  DAHDI/G1/${EXTEN},30,tT
+//-------------------------------------------------------------------------------------------
+struct ast_exten* armtel_find_ext(struct sip_request *req, char* context , char* exten,char* tech,char* cid_num,char*ext_full)
+{
+char tmp[256]="",*uri,*p1,*p2,*p3,*p4;
+//struct pbx_find_info q={.stacklen=0};
+struct ast_exten *ext=(struct ast_exten*)NULL;
+
+//номер из заголовка запроса
+   if(req->rlpart2) ast_copy_string(tmp,REQ_OFFSET_TO_STR(req,rlpart2),sizeof(tmp));
+   uri=ast_strdupa(get_in_brackets(tmp));
+   parse_uri_legacy_check(uri,"sip:,sips:",&p1,&p2,&p3,&p4);
+//   ast_log(LOG_WARNING, "URI Req uri=%s;1=%s;2=%s;3=%s;4=%s\n",uri,p1,p2,p3,p4);
+   strcpy(exten,p1);
+
+//номер из поля FROM запроса
+   ast_copy_string(tmp,sip_get_header(req,"From"),sizeof(tmp));
+   uri=ast_strdupa(get_in_brackets(tmp));
+   parse_uri_legacy_check(uri,"sip:,sips:",&p1,&p2,&p3,&p4);
+   strcpy(cid_num,p1);
+
+     ext= find_ext_dial(context,exten,cid_num);
+
+    if(ext){
+      strcpy(tech,ast_get_extension_app_data(ext));
+ //       ast_log(LOG_WARNING, "name=%s;appdata=%s;\n",ast_get_extension_name(ext),ast_get_extension_app_data(ext));
+ //  ast_log(LOG_WARNING, "name=%s;app=%s;appdata=%s;\n",ast_get_extension_name(ext),ast_get_extension_app(ext),ast_get_extension_app_data(ext));
+ //  ast_log(LOG_WARNING, "name=%s;appdata=%s;lbl=%s;prio=%s\n",ast_get_extension_name(ext),ast_get_extension_app_data(ext),ast_get_extension_label(ext),ast_get_extension_priority(ext));
+
+      if(!(p1=strchr(tech,'/'))){
+        return (struct ast_exten*) NULL;
+      }
+      else{ //это для такой записи в диалплане DAHDI/G1/${EXTEN},30,tT
+        *p1='\0';
+         if((p2=strchr(p1+1,'/'))){
+           *(p2+1)='\0';
+           strcpy(ext_full,p1+1);
+           strcat(ext_full,exten);
+          }
+          else{
+            strcpy(ext_full,exten);
+          }
+       }
+    }
+	return ext;
+}
+//-------------------------------------------------------------------------------
+//проверка запроса инвайт на принадлежность к группе армтел
+// возможен любой запрос при нажатии кнопок на пульте в режиме циркуляра селектора :)
+//-------------------------------------------------------------------------------
+int is_armtel_group(struct sip_pvt *p,struct sip_request *req,struct ast_sockaddr *addr)
+{
+struct ao2_iterator i;
+struct sip_pvt *sp =NULL;
+struct ast_bridge_channel *bc;
+struct ast_bridge *br;
+struct ast_exten *ext=NULL;
+char exten[32]="";
+char tech[32]="";
+char cid_num[32]="";
+char ext_full[32]="";
+char tmp[32]="";
+
+struct aics_proxy_params *pp;
+
+   ext=armtel_find_ext(req,p->context,exten,tech,cid_num,ext_full);
+   if(ext==(struct ast_exten*)NULL)return 0;
+//   ast_log(LOG_NOTICE, "--EXT ext=%s app=%s;tech=%s;ext_full=%s\n",exten,ast_get_extension_app(ext),tech,ext_ful
+   i=ao2_iterator_init(dialogs,0);
+ //ищем есть ли диалог от вызывающего абонента
+    while ((sp=ao2_iterator_next(&i))) {
+//       sip_pvt_lock(sp);
+	   if((sp->method != SIP_REGISTER) && (sp->method != SIP_SUBSCRIBE)){
+		   if(!strcmp(sp->username,cid_num)){
+		      struct ast_channel *owner=sp->owner;
+//ast_log(LOG_WARNING, "--PVT(%s) un=%s;fn=%s;sa=%s;cidnum=%s;\n",sip_methods[sp->method].text,sp->username,sp->fromname,ast_sockaddr_stringify(&(sp->sa)),sp->cid_num);
+	          if((owner) &&(ast_channel_appl(owner) !=NULL )&&(!strcmp(ast_channel_appl(owner),"ConfBridge") ) ) {
+                  pp=ast_channel_proxy(owner);
+                  if((pp)&&((pp->scenario==AICS_SCENARIO_CIRCULAR)||(pp->scenario==AICS_SCENARIO_SELECTOR) ||(pp->scenario==AICS_SCENARIO_GROUP))) {
+                  // циркуляр/селектор создан на aics
+                    if(pp->is_member){
+                    // участник
+     	        	     ast_log(LOG_WARNING, "Invite member(INIT AICS)=%s[%s]\n",exten,cid_num);
+                    }
+                    else{
+                    // инициатор
+                      br=ast_channel_internal_bridge(owner);
+	        	      if(br){
+	        	        int res;
+                         //ищем  вызываемый абонент в конференции
+          			    AST_LIST_TRAVERSE(&br->channels, bc, entry) {
+          			         res=check_member_armtel_group(bc,exten,tech);
+                             if(res==1){
+   	                            ast_log(LOG_NOTICE, "%s AICS:Delete member = %s \n",ast_channel_name(owner),ast_channel_name(bc->chan));
+          			            transmit_response(p, "603 Declined (Replaces)", req);
+//          			            sip_pvt_unlock(sp);
+                                 dialog_unref(sp, "drop ref in iterator loop");
+                                return INV_REQ_ERROR;
+                              }
+                              else if(res==2){
+   	                            //переключаем направление разговора
+   	                            if(pp->scenario!=AICS_SCENARIO_GROUP)
+   	                                   ast_log(LOG_NOTICE, "%s AICS:Mute member = %s \n",ast_channel_name(owner),ast_channel_name(bc->chan));
+   	                                   aics_send_armtel_sign(owner,AICS_ARMTEL_DIRECTION,0,AICS_CONTEXT_ARMTEL_ACT_LISTEN_BTN_OFF);
+          			            transmit_response(p, "603 Declined (Replaces)", req);
+//          			            sip_pvt_unlock(sp);
+                                dialog_unref(sp, "drop ref in iterator loop");
+                                return INV_REQ_ERROR;
+                              }
+                              else if(res==0) {
+//          			            sip_pvt_unlock(sp);
+                                dialog_unref(sp, "drop ref in iterator loop");
+                                continue;
+                              }
+          			    }
+          			   //надо проврить если абоненту идет звонок его надо отбить
+                        strcpy(tmp,tech);
+                        strcat(tmp,"/");
+                        strcat(tmp,exten);
+                        struct ast_channel *ac=ast_channel_get_by_name_prefix(tmp,strlen(tmp));
+                        struct ast_party_connected_line* cl=ast_channel_connected(ac);
+                        if(ac && cl)  ast_log(LOG_WARNING, "[%s]%s == %s \n",ast_channel_name(ac),cl->id.number.str,cid_num);
+                        if((ac) && (ast_channel_state(ac) != AST_STATE_DOWN) &&
+                                (ast_channel_state(ac) != AST_STATE_RESERVED) &&
+                                ((cl) && (cl->id.number.str) && (!strcmp(cl->id.number.str,cid_num)))  ){
+                         // отбиваем
+                               if(bc)
+   	                             ast_log(LOG_NOTICE, "%s AICS:Delete member = %s \n",ast_channel_name(owner),ast_channel_name(bc->chan));
+   	                           else
+   	                             ast_log(LOG_NOTICE, "%s AICS:Delete member = NULL \n",ast_channel_name(owner));
+   	                           ast_softhangup(ac,AST_SOFTHANGUP_ALL);
+   	                           ast_channel_release(ac);
+   			                   transmit_response(p, "603 Declined (Replaces)", req);
+//          			            sip_pvt_unlock(sp);
+          			            dialog_unref(sp, "drop ref in iterator loop");
+                               return INV_REQ_ERROR;
+                        }
+                        else{          			   //подключение абонента к группе армтел
+   	                          ast_log(LOG_NOTICE, "%s AICS:Add member = %s/%s \n",ast_channel_name(owner),tech,ext_full);
+     	        	          struct ast_dial *dial;
+     	        	          if((dial = pbx_add_member_armtel_group(owner,ext_full,tech)) != NULL){
+     	        	                    struct aics_dial_item* element;
+     	        	                    element = NULL;
+		                                if (element = ast_calloc(1, sizeof(*element))){
+                                          element->dial=(void*)dial;
+     	        	          			  AST_LIST_INSERT_TAIL(&pp->armtel_dial.armtel_dial,element, next);
+     	        	          			}
+     	        	          }
+   			                  transmit_response(p, "603 Declined (Replaces)", req);
+//          			           sip_pvt_unlock(sp);
+          			           dialog_unref(sp, "drop ref in iterator loop");
+                               return INV_REQ_ERROR;
+                        }
+                      }
+                    }
+	             }
+	          }
+	        }
+		  }
+//       sip_pvt_unlock(sp);
+       dialog_unref(sp, "drop ref in iterator loop");
+     }//   while (sp=ao2_iterator_next(&i)) {.....
+
+	ao2_iterator_destroy(&i);
+
+     return 0;
+}
+
+/* ~AICS */
 
 /*!
  * \brief Handle incoming SIP requests (methods)
@@ -28074,6 +30769,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 	int oldmethod = p->method;
 	int acked = 0;
 
+
 	/* RFC 3261 - 8.1.1 A valid SIP request must contain To, From, CSeq, Call-ID and Via.
 	 * 8.2.6.2 Response must have To, From, Call-ID CSeq, and Via related to the request,
 	 * so we can check to make sure these fields exist for all requests and responses */
@@ -28097,6 +30793,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 		if (!p->initreq.headers) {	/* New call */
 			pvt_set_needdestroy(p, "no headers");
 		}
+		//ast_log(LOG_NOTICE, "!p->initreq.headers\n");
 		return -1;
 	}
 	/* Get the command XXX */
@@ -28106,8 +30803,39 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 
 	/* Save useragent of the client */
 	useragent = sip_get_header(req, "User-Agent");
-	if (!ast_strlen_zero(useragent))
+	if (!ast_strlen_zero(useragent)) {
+		//ast_log(LOG_NOTICE, "change ua %s on %s\n", p->useragent, useragent);
 		ast_string_field_set(p, useragent, useragent);
+	}
+	
+	/* AICS support for Armtel headers */
+	if ((req->method == SIP_INVITE) || (req->method == SIP_UPDATE) || (req->method == SIP_MESSAGE)) {
+		aics_priority_set(&p->aics_proxy, sip_get_header(req, H_PRIORITY));
+		aics_direction_set(&p->aics_proxy, sip_get_header(req, H_ARMTEL_DIRECTION));
+		aics_scenario_set(&p->aics_proxy, sip_get_header(req, H_ARMTEL_SCENARIO));
+		aics_playlist_set(&p->aics_proxy, sip_get_header(req, H_ARMTEL_PLAYLIST));
+		aics_relay_set(&p->aics_proxy, sip_get_header(req, H_ARMTEL_RELAY));
+		aics_event_set(&p->aics_proxy, sip_get_header(req, H_ARMTEL_EVENT));
+
+//		p->aics_proxy.priority = aics_priority_from_str(sip_get_header(req, H_PRIORITY));
+//		p->aics_proxy.direction = aics_direction_from_str(sip_get_header(req, H_ARMTEL_DIRECTION));
+//		p->aics_proxy.scenario = aics_scenario_from_str(sip_get_header(req, H_ARMTEL_SCENARIO));
+//		aics_playlist_from_str(&p->aics_proxy.playlist, sip_get_header(req, H_ARMTEL_PLAYLIST));
+//		aics_relay_from_str(&p->aics_proxy.relay[0], sizeof(p->aics_proxy.relay)/sizeof(p->aics_proxy.relay[0]), sip_get_header(req, H_ARMTEL_RELAY));
+//		aics_event_from_str(&p->aics_proxy.event[0], sizeof(p->aics_proxy.event)/sizeof(p->aics_proxy.event[0]), sip_get_header(req, H_ARMTEL_EVENT));
+	}
+//	if (req->method == SIP_INVITE) {
+//		const char *priostr = sip_get_header(req, H_PRIORITY);
+//		ast_log(LOG_NOTICE, "AICS Incoming INVITE Call Priority '%s'\n", priostr);
+//		//aics_addons_notice(ast_channel_addons(p->owner));
+//		if (!ast_strlen_zero(priostr)) {
+//			//ast_string_field_set(p, callpriority, priostr);
+//			p->aics_addons.callpriority = aics_priority_str2int(priostr);
+//		} else {
+//			p->aics_addons.callpriority = aics_priority_str2int(global_callpriority);
+//		}
+//	}
+	/* ~AICS */
 
 	/* Find out SIP method for incoming request */
 	if (req->method == SIP_RESPONSE) {	/* Response to our request */
@@ -28137,6 +30865,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 		}
 		if (p->ocseq && (p->ocseq < seqno)) {
 			ast_debug(1, "Ignoring out of order response %u (expecting %u)\n", seqno, p->ocseq);
+			//ast_log(LOG_NOTICE, "Ignoring out of order response %u (expecting %u)\n", seqno, p->ocseq);
 			return -1;
 		} else {
 			if ((respid == 200) || ((respid >= 300) && (respid <= 399))) {
@@ -28188,6 +30917,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 			} else if (req->method != SIP_ACK) {
 				transmit_response(p, "500 Server error", req);	/* We must respond according to RFC 3261 sec 12.2 */
 			}
+			//ast_log(LOG_NOTICE, "seqno %u <> pending %u\n", seqno, p->pendinginvite);
 			return -1;
 		}
 	} else if (p->icseq &&
@@ -28204,7 +30934,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 	/* RFC 3261 section 9. "CANCEL has no effect on a request to which a UAS has
 	 * already given a final response." */
 	if (!p->pendinginvite && (req->method == SIP_CANCEL)) {
-		transmit_response(p, "481 Call/Transaction Does Not Exist", req);
+		transmit_response(p, "481 Call/Transaction Does Not Exist (RFC3261 s9)", req);
 		return res;
 	}
 
@@ -28241,11 +30971,11 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 				gettag(req, "To", totag, sizeof(totag));
 				ast_string_field_set(p, tag, totag);
 				p->pendinginvite = p->icseq;
-				transmit_response_reliable(p, "481 Call/Transaction Does Not Exist", req);
+				transmit_response_reliable(p, "481 Call/Transaction Does Not Exist (RFC3261 s12.2)", req);
 				/* Will cease to exist after ACK */
 				return res;
 			} else if (req->method != SIP_ACK) {
-				transmit_response(p, "481 Call/Transaction Does Not Exist", req);
+				transmit_response(p, "481 Call/Transaction Does Not Exist (RFC3261 s12.2)+", req);
 				sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
 				return res;
 			}
@@ -28256,6 +30986,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 	if (!e && (p->method == SIP_INVITE || p->method == SIP_SUBSCRIBE || p->method == SIP_REGISTER || p->method == SIP_NOTIFY || p->method == SIP_PUBLISH)) {
 		transmit_response(p, "400 Bad request", req);
 		sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+		//ast_log(LOG_NOTICE, "400 bad req\n");
 		return -1;
 	}
 
@@ -28265,7 +30996,11 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 		res = handle_request_options(p, req, addr, e);
 		break;
 	case SIP_INVITE:
-		res = handle_request_invite(p, req, addr, seqno, recount, e, nounlock);
+		/* AICS support for Armtel headers */
+		res = is_armtel_group(p,req,addr);
+		if( res == 0)
+		/* ~AICS */
+		 res = handle_request_invite(p, req, addr, seqno, recount, e, nounlock);
 
 		if (res < 9) {
 			sip_report_security_event(p, req, res);
@@ -28322,8 +31057,22 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 		break;
 	case SIP_UPDATE:
 		res = handle_request_update(p, req);
+
 		break;
 	case SIP_ACK:
+			/* AICS support for Armtel headers */
+		{
+		// это поддержка одностороннего управления
+	     struct ast_channel *owner=p->owner;
+         if((owner)&&(ast_channel_appl(owner) !=NULL ) &&(!strcmp(ast_channel_appl(owner),"Dial") ) ) {
+             struct aics_proxy_params *pp=ast_channel_proxy(owner);
+             if((pp)&&(pp->scenario==AICS_SCENARIO_CIRCULAR)) {
+            	     aics_send_armtel_sign(p->owner,AICS_ARMTEL_DIRECTION,0,AICS_CONTEXT_ARMTEL_ACT_LISTEN);
+                     ast_log(LOG_WARNING, "-----ONEWAY-------_CIRCULAR=%s ]\n",ast_channel_name(owner));
+             }
+          }
+        }
+		/* ~AICS */
 		/* Make sure we don't ignore this */
 		if (seqno == p->pendinginvite) {
 			p->invitestate = INV_TERMINATED;
@@ -28331,6 +31080,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 			acked = __sip_ack(p, seqno, 1 /* response */, 0);
 			if (p->owner && find_sdp(req)) {
 				if (process_sdp(p, req, SDP_T38_NONE)) {
+					//ast_log(LOG_NOTICE, "ack proc sdp\n");
 					return -1;
 				}
 				if (ast_test_flag(&p->flags[0], SIP_DIRECT_MEDIA)) {
@@ -28362,6 +31112,7 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 		}
 		break;
 	}
+//if (res != 0) ast_log(LOG_NOTICE, "ret res %d\n", res);
 	return res;
 }
 
@@ -28445,6 +31196,7 @@ static int handle_request_do(struct sip_request *req, struct ast_sockaddr *addr)
 		return 1;
 	}
 	ast_mutex_lock(&netlock);
+
 
 	/* Find the active SIP dialog or create a new one */
 	p = find_call(req, addr, req->method);	/* returns p with a reference only. _NOT_ locked*/
@@ -28728,6 +31480,127 @@ static int get_cached_mwi(struct sip_peer *peer, int *new, int *old)
 
 	return in_cache;
 }
+
+//// AICS Send armtel event to peer
+//static int sip_send_armtel_to_peer(struct sip_peer *peer)
+//{
+//	/* Called with peer lock, but releases it */
+//	struct sip_pvt *p;
+//
+//	ao2_lock(peer);
+//
+//	/* Do we have an IP address? If not, skip this peer */
+//	if (ast_sockaddr_isnull(&peer->addr) && ast_sockaddr_isnull(&peer->defaddr)) {
+//		ao2_unlock(peer);
+//		return -1;
+//	}
+//ast_log(LOG_NOTICE,"peername %s \n",peer->name);
+////	if (peer->armtelpvt) {
+////		/* Base message on subscription */
+////		p = dialog_ref(peer->armtelpvt, "sip_send_armtel_to_peer: Setting dialog ptr p from peer->armtelpvt");
+////		ao2_unlock(peer);
+////	} else
+//	{
+//		ao2_unlock(peer);
+//		/* Build temporary dialog for this message */
+//		if (!(p = sip_alloc(NULL, NULL, 0, SIP_NOTIFY, NULL, NULL))) {
+//			return -1;
+//		}
+//		/* If we don't set the socket type to 0, then create_addr_from_peer will fail immediately if the peer
+//		 * uses any transport other than UDP. We set the type to 0 here and then let create_addr_from_peer copy
+//		 * the peer's socket information to the sip_pvt we just allocated
+//		 */
+//		set_socket_transport(&p->socket, 0);
+//		if (create_addr_from_peer(p, peer)) {
+//			/* Maybe they're not registered, etc. */
+//			dialog_unlink_all(p);
+//			dialog_unref(p, "unref dialog p just created via sip_alloc");
+//			return -1;
+//		}
+//		/* Recalculate our side, and recalculate Call ID */
+//		ast_sip_ouraddrfor(&p->sa, &p->ourip, p);
+//		build_via(p);
+//
+////		ao2_lock(peer);
+////		if (!ast_strlen_zero(peer->mwi_from)) {
+////			ast_string_field_set(p, mwi_from, peer->mwi_from);
+////		} else if (!ast_strlen_zero(default_mwi_from)) {
+////			ast_string_field_set(p, mwi_from, default_mwi_from);
+////		}
+////		ao2_unlock(peer);
+//
+//		/* Change the dialog callid. */
+//		change_callid_pvt(p, NULL);
+//		/* Destroy this session after 32 secs */
+//		sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+//	}
+//
+//	/* We have multiple threads (armtel events and monitor retransmits) working with this PVT and as we modify the sip history if that's turned on,
+//	   we really need to have a lock on it */
+//	sip_pvt_lock(p);
+//
+//	/* Send MWI */
+//	ast_set_flag(&p->flags[0], SIP_OUTGOING);
+//
+//	/* the following will decrement the refcount on p as it finishes */
+//
+//	{
+//		struct sip_request req;
+//		struct ast_str *out = ast_str_alloca(500);
+//		int ourport = (p->fromdomainport && (p->fromdomainport != STANDARD_SIP_PORT)) ? p->fromdomainport : ast_sockaddr_port(&p->ourip);
+//		const char *domain;
+//		//const char *exten = S_OR(vmexten, default_vmexten);
+//		const struct cfsubscription_types *subscriptiontype;
+//		initreqprep(&req, p, SIP_NOTIFY, NULL);
+//		subscriptiontype = find_subscription_type(AIDF_XML);
+//		add_header(&req, "Event", subscriptiontype->event);
+//		add_header(&req, "Content-Type", subscriptiontype->mediatype);
+//
+//
+//		/* domain initialization occurs here because initreqprep changes ast_sockaddr_stringify string. */
+//		domain = S_OR(p->fromdomain, ast_sockaddr_stringify_host_remote(&p->ourip));
+//
+////		if (!sip_standard_port(p->socket.type, ourport)) {
+////			if (p->socket.type == AST_TRANSPORT_UDP) {
+////				ast_str_append(&out, 0, "Message-Account: sip:%s@%s:%d\r\n", exten, domain, ourport);
+////			} else {
+////				ast_str_append(&out, 0, "Message-Account: sip:%s@%s:%d;transport=%s\r\n", exten, domain, ourport, sip_get_transport(p->socket.type));
+////			}
+////		} else {
+////			if (p->socket.type == AST_TRANSPORT_UDP) {
+////				ast_str_append(&out, 0, "Message-Account: sip:%s@%s\r\n", exten, domain);
+////			} else {
+////				ast_str_append(&out, 0, "Message-Account: sip:%s@%s;transport=%s\r\n", exten, domain, sip_get_transport(p->socket.type));
+////			}
+////		}
+//		/* Cisco has a bug in the SIP stack where it can't accept the
+//			(0/0) notification. This can temporarily be disabled in
+//			sip.conf with the "buggymwi" option */
+////		ast_str_append(&out, 0, "Voice-Message: %d/%d%s\r\n",
+////			newmsgs, oldmsgs, (ast_test_flag(&p->flags[1], SIP_PAGE2_BUGGY_MWI) ? "" : " (0/0)"));
+//
+//		if (p->subscribed) {
+//			if (p->expiry) {
+//				add_header(&req, "Subscription-State", "active");
+//			} else {	/* Expired */
+//				add_header(&req, "Subscription-State", "terminated;reason=timeout");
+//			}
+//		}
+//
+//		add_content(&req, ast_str_buffer(out));
+//
+//		if (!p->initreq.headers) {
+//			initialize_initreq(p, &req);
+//		}
+//		return send_request(p, &req, XMIT_RELIABLE, p->ocseq);
+//	}
+//
+//
+//	sip_pvt_unlock(p);
+//	dialog_unref(p, "unref dialog ptr p just before it goes out of scope at the end of sip_send_armtel_to_peer.");
+//
+//	return 0;
+//}
 
 /*! \brief Send message waiting indication to alert peer that they've got voicemail
  *  \note Both peer and associated sip_pvt must be unlocked prior to calling this function
@@ -29047,6 +31920,40 @@ static void *do_monitor(void *data)
 			ast_debug(1, "chan_sip: ast_sched_runq ran %d all at once\n", res);
 		}
 		ast_mutex_unlock(&monlock);
+#ifdef SIP_ARMTEL_QUEUE
+	    struct sip_peer *pi;	
+		struct ao2_iterator i;
+//		struct timeval timer = { 0, 0 };
+//		gettimeofday(&timer, NULL);
+		static int t=10;
+
+
+//        t=ast_tvdiff_ms(ast_tvnow(), timer);
+    	if(t ==0){
+		 i = ao2_iterator_init(peers, 0);
+		 while ((pi = ao2_iterator_next(&i))) {
+		   if (!ast_strlen_zero(pi->armtel_queue)){
+		    char buf[32];
+		    sprintf(buf,"SIP/%s",pi->name);
+			//  ast_log(LOG_ERROR, "!!!!!++++++[%s][%d]\n",buf,ast_device_state(buf));
+		    if (ast_device_state(buf) == AST_DEVICE_NOT_INUSE )
+		    {
+			 check_armtel_queue(pi->name);
+		    }
+		   }
+		   sip_unref_peer(pi,"");
+		 }
+		 ao2_iterator_destroy(&i);
+		 t=10;
+		}
+		t--;
+
+		if(strlen(mailid)>0){
+		//     ast_log(LOG_ERROR, "!!!!!++++++[%s]\n",mailid);
+			 check_armtel_queue(mailid);
+			 mailid[0]=0;
+		}
+#endif		
 	}
 
 	/* Never reached */
@@ -29483,6 +32390,24 @@ static int sip_poke_noanswer(const void *data)
 	if (peer->lastms > -1) {
 
 		ast_log(LOG_NOTICE, "Peer '%s' is now UNREACHABLE!  Last qualify: %d\n", peer->name, peer->lastms);
+
+		/* AICS drop all dialogs */
+		struct ao2_iterator i;
+		struct sip_pvt *cur;
+		i = ao2_iterator_init(dialogs, 0);
+		while ((cur = ao2_t_iterator_next(&i, "iterate thru dialogs"))) {
+			sip_pvt_lock(cur);
+			if (!strcasecmp(cur->peername, peer->name) && cur->owner) {
+				ast_log(LOG_NOTICE, "Hangup %s channel\n", cur->callid);
+				ast_queue_hangup_with_cause(cur->owner, AST_CAUSE_NOANSWER);
+			}
+			sip_pvt_unlock(cur);
+			ao2_t_ref(cur, -1, "toss dialog ptr set by iterator_next");
+		}
+		ao2_iterator_destroy(&i);
+
+		/* ~AICS */
+
 		if (sip_cfg.peer_rtupdate) {
 			ast_update_realtime(ast_check_realtime("sipregs") ? "sipregs" : "sippeers", "name", peer->name, "lastms", "-1", SENTINEL);
 		}
@@ -29510,7 +32435,7 @@ static int sip_poke_noanswer(const void *data)
 	/* Don't send a devstate change if nothing changed. */
 	if (peer->lastms > -1) {
 		peer->lastms = -1;
-		ast_devstate_changed(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
+		ast_devstate_changed_stub(AST_DEVICE_UNKNOWN, AST_DEVSTATE_CACHABLE, "SIP/%s", peer->name);
 	}
 
 	/* Try again quickly */
@@ -29728,6 +32653,81 @@ static int sip_devicestate(const char *data)
 	return res;
 }
 
+/* AICS support for SIP 'Priority:' header */
+/*! \brief AICS Find a companion dialog priority based on sip_pvt peername information
+ * \param p Sip_pvt to search for
+ * \param[out] pvt_addons of found sip_pvt
+ * \retval pointer to ast_channel Success
+ * \retval NULL Failure
+ */
+//static int find_same_dialstr_priority(struct sip_pvt *p, char **foundpriority)
+//struct ast_channel *find_same_peername_priority(struct sip_pvt *p, int *foundpriority)
+struct ast_channel *get_same_peername_channel(struct sip_pvt *p, struct aics_local_params **params)//struct aics_pvt_addons **pvt_addons)
+{
+	struct sip_pvt *cur;
+	char *searchstr = NULL;
+	struct ao2_iterator i;
+	struct ast_channel *retval = NULL;
+
+	*params = NULL;
+	if (!p)
+		return retval;
+	searchstr = ast_strdup(p->peername);
+//	ast_log(LOG_NOTICE, "Search string='%s'\n", searchstr ? searchstr : "NULL");
+	if (ast_strlen_zero(searchstr))
+		return retval;
+
+	i = ao2_iterator_init(dialogs, 0);
+	while ((cur = ao2_t_iterator_next(&i, "iterate thru dialogs"))) {
+//		sip_pvt_lock(cur);
+		//ast_log(LOG_NOTICE, "Iterate peername='%s' dialstr='%s' callid='%s' priority='%s' owner=%p\n", cur->peername, cur->dialstring, cur->callid, cur->callpriority, cur->owner);
+		if (!strcmp(cur->peername, searchstr)) {
+			if ((p != cur) && (cur->owner)) {
+				//struct aics_channel_addons *chaddons = ast_channel_addons(cur->owner);
+				struct aics_proxy_params *chproxy = ast_channel_proxy(cur->owner);
+
+				if ((!retval)||(chproxy->scenario != AICS_SCENARIO_NONE)) {
+					if (params)
+						*params = &cur->aics_local;
+					if (!retval) {
+						retval = cur->owner;
+						ast_log(LOG_NOTICE, "Found %s\n", ast_channel_name(retval));
+					}
+					if (chproxy->scenario != AICS_SCENARIO_NONE) {
+						retval = cur->owner;
+						ast_log(LOG_NOTICE, "Found %s in scenario %s\n", ast_channel_name(retval), aics_scenario_to_str(chproxy->scenario));
+//						sip_pvt_unlock(cur);
+						dialog_unref(cur, "drop ref in iterator loop break");
+						break;
+					}
+				}
+
+			}
+
+//			if ((p != cur) && (cur->owner)) {//if (p != cur){
+//				//ast_log(LOG_NOTICE, "p != cur\n");
+//				if (pvt_addons)
+//					*pvt_addons = &cur->aics_addons;
+////				if(foundpriority) {
+////					*foundpriority = cur->aics_addons.callpriority;//*foundpriority = ast_strdupa(cur->callpriority);
+////				}
+//				//retval++;
+//				retval = cur->owner;
+//				sip_pvt_unlock(cur);
+//				dialog_unref(cur, "drop ref in iterator loop break");
+//				break;
+//			} /*else {
+//				ast_log(LOG_NOTICE, "p == cur\n");
+//			}*/
+		}
+//		sip_pvt_unlock(cur);
+		dialog_unref(cur, "drop ref in iterator loop");
+	}
+	ao2_iterator_destroy(&i);
+	ast_free(searchstr);
+	return retval;
+}/* ~AICS */
+
 /*! \brief PBX interface function -build SIP pvt structure
  *	SIP calls initiated by the PBX arrive here.
  *
@@ -29764,7 +32764,9 @@ static struct ast_channel *sip_request_call(const char *type, struct ast_format_
 		AST_APP_ARG(exten);
 		AST_APP_ARG(remote_address);
 	);
-
+	ast_log(LOG_NOTICE, "AICS C:%p \n", requestor);
+	ast_log(LOG_NOTICE, "type=%s;dest=%s \n", type,dest);
+//ast_log(LOG_NOTICE, "AICS C:%p P: %p\n", requestor, ast_channel_tech_pvt(requestor));
 	/* mask request with some set of allowed formats.
 	 * XXX this needs to be fixed.
 	 * The original code uses AST_FORMAT_AUDIO_MASK, but it is
@@ -29952,6 +32954,128 @@ static struct ast_channel *sip_request_call(const char *type, struct ast_format_
 	ast_format_cap_append(p->prefcaps, cap);
 	ast_format_cap_joint_copy(cap, p->caps, p->jointcaps);
 
+	/* AICS support for SIP 'Priority:' header */
+//	if (requestor)
+//	{
+
+	struct sip_peer * called_peer = sip_find_peer(dest, NULL, TRUE, FINDUSERS, FALSE, 0);
+	enum aics_priority_handle called_peer_hdl = aics_priority_handle_from_str(called_peer?called_peer->priorityhandle:global_priorityhandle);
+
+	struct aics_proxy_params *reqparams = ast_channel_proxy(requestor);
+	int channelpriority = (reqparams?reqparams->priority:aics_priority_from_str(global_callpriority));
+	struct aics_local_params *pvt_local;
+	tmpc = get_same_peername_channel(p, &pvt_local);
+	struct aics_proxy_params *tmpparams = ast_channel_proxy(tmpc);
+	int foundpriority = (tmpparams?tmpparams->priority:aics_priority_from_str(global_callpriority));
+	ast_log(LOG_NOTICE, "req '%s' found '%s' called_peer_hdl '%s' %d \n", (requestor?ast_channel_name(requestor):"null"), (tmpc?ast_channel_name(tmpc):"null"), (called_peer?called_peer->priorityhandle:"null"), called_peer_hdl);
+//		aics_addons_notice(reqaddons, "sip_request_call req");
+//		aics_pvt_addons_notice(pvt_addons, "sip_request_call pvt");
+//		aics_addons_notice(tmpaddons, "sip_request_call tmp");
+	//aics_debug_channels();
+	if (tmpc && pvt_local && requestor) {
+//			tmpaddons->pvt_addons.priority_handle
+//			tmpaddons->pvt_addons.hangup_anounce
+		ast_log(LOG_NOTICE, "Translated existing [%d] current [%d] inhdl [%s] \n",//phandle [%s] hanounce [%s]
+				channelpriority,
+				foundpriority,
+				aics_priority_handle_to_str(called_peer_hdl)/*,
+				aics_priority_handle_type[tmpaddons->pvt_addons.priority_handle],
+				(tmpaddons->pvt_addons.hangup_anounce?tmpaddons->pvt_addons.hangup_anounce:"null")*/);
+		if (called_peer_hdl != AICS_PRIORITY_HANDLE_QUEUE) {
+
+			switch (pvt_local->priority_handle) {
+				case AICS_PRIORITY_HANDLE_NONE: {
+
+				} break;
+				case AICS_PRIORITY_HANDLE_HANGUP: {
+					if (channelpriority > foundpriority) {
+						ast_log(LOG_NOTICE, "Hangup existing call %s\n", ast_channel_name(tmpc));
+						ast_queue_hangup_with_cause(tmpc, AST_CAUSE_BUSY);
+//						tmpc = NULL;
+//						// BAD_BAD_CODE!!!!
+//						while ((tmpc = get_same_peername_channel(p, &pvt_addons))) {
+//							ast_log(LOG_NOTICE, "Hangup existing call %s\n", ast_channel_name(tmpc));
+//							ast_queue_hangup_with_cause(tmpc, AST_CAUSE_BUSY);
+//							tmpc = NULL;
+//						}
+						//sip_hangup(tmpc);
+					} else {
+						ast_log(LOG_NOTICE, "Hangup current call\n");
+						*cause = AST_CAUSE_BUSY;
+						ast_debug(3, "Cant create SIP call - target device busy with higher priority call\n");
+						dialog_unlink_all(p);
+						dialog_unref(p, "unref dialog p BUSY (call priority)");
+						if (callid) {
+							ast_callid_unref(callid);
+						}
+						return NULL;
+					}
+				} break;
+				case AICS_PRIORITY_HANDLE_HOLD: {
+					if (channelpriority > foundpriority) {
+						ast_log(LOG_NOTICE, "Hangup existing call\n");
+						ast_queue_hangup_with_cause(tmpc, AST_CAUSE_BUSY);
+						//sip_hangup(tmpc);
+					} else {
+						ast_log(LOG_NOTICE, "Hangup current call\n");
+						*cause = AST_CAUSE_BUSY;
+						ast_debug(3, "Cant create SIP call - target device busy with higher priority call\n");
+						dialog_unlink_all(p);
+						dialog_unref(p, "unref dialog p BUSY (call priority)");
+						if (callid) {
+							ast_callid_unref(callid);
+						}
+						return NULL;
+					}
+
+				} break;
+				case AICS_PRIORITY_HANDLE_HANGUP_NOTIFY: {
+					if (channelpriority > foundpriority) {
+						ast_log(LOG_NOTICE, "Hangup existing call\n");
+						ast_queue_hangup_with_cause(tmpc, AST_CAUSE_BUSY);
+						//sip_hangup(tmpc);
+					} else {
+						ast_log(LOG_NOTICE, "Hangup current call\n");
+						*cause = AST_CAUSE_BUSY;
+						ast_debug(3, "Cant create SIP call - target device busy with higher priority call\n");
+						dialog_unlink_all(p);
+						dialog_unref(p, "unref dialog p BUSY (call priority)");
+						if (callid) {
+							ast_callid_unref(callid);
+						}
+						return NULL;
+					}
+
+				} break;
+				case AICS_PRIORITY_HANDLE_QUEUE: {
+					if (channelpriority > foundpriority) {
+						ast_log(LOG_NOTICE, "Hangup existing call\n");
+						ast_queue_hangup_with_cause(tmpc, AST_CAUSE_BUSY);
+						//sip_hangup(tmpc);
+					} else {
+						ast_log(LOG_NOTICE, "Hangup current call\n");
+						*cause = AST_CAUSE_BUSY;
+						ast_debug(3, "Cant create SIP call - target device busy with higher priority call\n");
+						dialog_unlink_all(p);
+						dialog_unref(p, "unref dialog p BUSY (call priority)");
+						if (callid) {
+							ast_callid_unref(callid);
+						}
+						return NULL;
+					}
+
+				} break;
+
+			}
+		}
+
+	} /*else {
+		ast_log(LOG_NOTICE, "Not Found string='%s' in channel='%s'\n", foundpriority, channelpriority);
+	}*/
+	tmpc = NULL;
+//	}
+	/* ~AICS */
+
 	sip_pvt_lock(p);
 
 	tmpc = sip_new(p, AST_STATE_DOWN, host, assignedids, requestor, callid);	/* Place the call */
@@ -29964,6 +33088,12 @@ static struct ast_channel *sip_request_call(const char *type, struct ast_format_
 		dialog_unlink_all(p);
 		/* sip_destroy(p); */
 	} else {
+		struct aics_proxy_params *dstparams = ast_channel_proxy(tmpc);
+		struct aics_proxy_params *srcparams = ast_channel_proxy(requestor);
+		if ((srcparams)&& (dstparams)){
+			if((srcparams->scenario == AICS_SCENARIO_SELECTOR) || (srcparams->scenario == AICS_SCENARIO_CIRCULAR)|| (srcparams->scenario == AICS_SCENARIO_GROUP)|| (srcparams->scenario == AICS_SCENARIO_CONFERENCE))
+			                 dstparams->is_member=1;
+		}
 		ast_channel_unlock(tmpc);
 	}
 	dialog_unref(p, "toss pvt ptr at end of sip_request_call");
@@ -30433,6 +33563,7 @@ static void set_peer_defaults(struct sip_peer *peer)
 	peer->rtpholdtimeout = global_rtpholdtimeout;
 	peer->rtpkeepalive = global_rtpkeepalive;
 	peer->allowtransfer = sip_cfg.allowtransfer;
+	peer->spy = FALSE;
 	peer->autoframing = global_autoframing;
 	peer->t38_maxdatagram = global_t38_maxdatagram;
 	peer->qualifyfreq = global_qualifyfreq;
@@ -30462,6 +33593,7 @@ static void set_peer_defaults(struct sip_peer *peer)
 	peer->timer_t1 = global_t1;
 	peer->timer_b = global_timer_b;
 	clear_peer_mailboxes(peer);
+//	clear_peer_armtel_event(peer);
 	peer->disallowed_methods = sip_cfg.disallowed_methods;
 	peer->transports = default_transports;
 	peer->default_outbound_transport = default_primary_transport;
@@ -30608,6 +33740,11 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v, str
 			return NULL;
 		}
 
+//		if (!(peer->armtel_event.armtel_body = ast_str_create(SIP_MIN_PACKET))) {
+//			ao2_t_ref(peer, -1, "failed to allocate armtel_body for peer");
+//			return NULL;
+//		}
+
 		if (realtime && !ast_test_flag(&global_flags[1], SIP_PAGE2_RTCACHEFRIENDS)) {
 			ast_atomic_fetchadd_int(&rpeerobjs, 1);
 			ast_debug(3, "-REALTIME- peer built. Name: %s. Peer objects: %d\n", name, rpeerobjs);
@@ -30713,10 +33850,20 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v, str
 				}
 			} else if (!strcasecmp(v->name, "remotesecret")) {
 				ast_string_field_set(peer, remotesecret, v->value);
+#ifdef SIP_ARMTEL_QUEUE
+			} else if (!strcasecmp(v->name, "armtel_queue")) {
+				ast_string_field_set(peer, armtel_queue, v->value);
+#endif				
 			} else if (!strcasecmp(v->name, "secret")) {
 				ast_string_field_set(peer, secret, v->value);
 			} else if (!strcasecmp(v->name, "description")) {
 				ast_string_field_set(peer, description, v->value);
+			} else if (!strcasecmp(v->name, "callpriority")) {
+				ast_string_field_set(peer, callpriority, v->value); /* AICS support for sip.conf callpriority field */
+			} else if (!strcasecmp(v->name, "priorityhandle")) {
+				ast_string_field_set(peer, priorityhandle, v->value); /* AICS support for sip.conf priorityhandle field */
+			} else if (!strcasecmp(v->name, "hangupanounce")) {
+				ast_string_field_set(peer, hangupanounce, v->value); /* AICS support for sip.conf hangupanounce field */
 			} else if (!strcasecmp(v->name, "md5secret")) {
 				ast_string_field_set(peer, md5secret, v->value);
 			} else if (!strcasecmp(v->name, "auth")) {
@@ -30928,6 +34075,8 @@ static struct sip_peer *build_peer(const char *name, struct ast_variable *v, str
 				ast_set2_flag(&peer->flags[1], ast_true(v->value), SIP_PAGE2_PREFERRED_CODEC);
 			} else if (!strcasecmp(v->name, "autoframing")) {
 				peer->autoframing = ast_true(v->value);
+			} else if (!strcasecmp(v->name, "spy")) {
+				peer->spy = ast_true(v->value);
 			} else if (!strcasecmp(v->name, "rtptimeout")) {
 				if ((sscanf(v->value, "%30d", &peer->rtptimeout) != 1) || (peer->rtptimeout < 0)) {
 					ast_log(LOG_WARNING, "'%s' is not a valid RTP hold time at line %d.  Using default.\n", v->value, v->lineno);
@@ -31527,6 +34676,10 @@ static int reload_config(enum channelreloadreason reason)
 	sip_cfg.allowsubscribe = FALSE;
 	sip_cfg.disallowed_methods = SIP_UNKNOWN;
 	sip_cfg.contact_acl = NULL;		/* Reset the contact ACL */
+	snprintf(global_callpriority, sizeof(global_callpriority), "%s", DEFAULT_CALLPRIORITY); /* AICS support for sip.conf callpriority field */
+	snprintf(global_priorityhandle, sizeof(global_priorityhandle), "%s", DEFAULT_PRIORITYHANDLE); /* AICS support for sip.conf priorityhandle field */
+	snprintf(global_hangupanounce, sizeof(global_hangupanounce), "%s", DEFAULT_HANGUPANOUNCE); /* AICS support for sip.conf hangupanounce field */
+	snprintf(global_ipn20UA, sizeof(global_ipn20UA), "%s", DEFAULT_IPN20UA); /* AICS support for sip.conf IPN2.0 devices */
 	snprintf(global_useragent, sizeof(global_useragent), "%s %s", DEFAULT_USERAGENT, ast_get_version());
 	snprintf(global_sdpsession, sizeof(global_sdpsession), "%s %s", DEFAULT_SDPSESSION, ast_get_version());
 	snprintf(global_sdpowner, sizeof(global_sdpowner), "%s", DEFAULT_SDPOWNER);
@@ -31658,6 +34811,14 @@ static int reload_config(enum channelreloadreason reason)
 			ast_copy_string(sip_cfg.realm, v->value, sizeof(sip_cfg.realm));
 		} else if (!strcasecmp(v->name, "domainsasrealm")) {
 			sip_cfg.domainsasrealm = ast_true(v->value);
+		} else if (!strcasecmp(v->name, "ipn20UA")) {
+			ast_copy_string(global_ipn20UA, v->value, sizeof(global_ipn20UA)); /* AICS support for sip.conf IPN2.0 devices */
+		} else if (!strcasecmp(v->name, "callpriority")) {
+			ast_copy_string(global_callpriority, v->value, sizeof(global_callpriority)); /* AICS support for sip.conf callpriority field */
+		} else if (!strcasecmp(v->name, "priorityhandle")) {
+			ast_copy_string(global_priorityhandle, v->value, sizeof(global_priorityhandle)); /* AICS support for sip.conf priorityhandle field */
+		} else if (!strcasecmp(v->name, "hangupanounce")) {
+			ast_copy_string(global_hangupanounce, v->value, sizeof(global_hangupanounce)); /* AICS support for sip.conf hangupanounce field */
 		} else if (!strcasecmp(v->name, "useragent")) {
 			ast_copy_string(global_useragent, v->value, sizeof(global_useragent));
 			ast_debug(1, "Setting SIP channel User-Agent Name to %s\n", global_useragent);
@@ -33472,6 +36633,7 @@ static struct ast_cli_entry cli_sip[] = {
 	AST_CLI_DEFINE(sip_show_registry, "List SIP registration status"),
 	AST_CLI_DEFINE(sip_unregister, "Unregister (force expiration) a SIP peer from the registry"),
 	AST_CLI_DEFINE(sip_show_settings, "Show SIP global settings"),
+	AST_CLI_DEFINE(sip_show_armtel, "Show Armtel event subscriptions"),
 	AST_CLI_DEFINE(sip_show_mwi, "Show MWI subscriptions"),
 	AST_CLI_DEFINE(sip_cli_notify, "Send a notify packet to a SIP peer"),
 	AST_CLI_DEFINE(sip_show_channel, "Show detailed SIP channel info"),
@@ -34278,12 +37440,16 @@ AST_TEST_DEFINE(get_in_brackets_const_test)
 	MEMBER(sip_peer, mohsuggest, AST_DATA_STRING)		\
 	MEMBER(sip_peer, parkinglot, AST_DATA_STRING)		\
 	MEMBER(sip_peer, useragent, AST_DATA_STRING)		\
+	MEMBER(sip_peer, callpriority, AST_DATA_STRING)		\
+	MEMBER(sip_peer, priorityhandle, AST_DATA_STRING)		\
+	MEMBER(sip_peer, hangupanounce, AST_DATA_STRING)		\
 	MEMBER(sip_peer, mwi_from, AST_DATA_STRING)		\
 	MEMBER(sip_peer, engine, AST_DATA_STRING)		\
 	MEMBER(sip_peer, unsolicited_mailbox, AST_DATA_STRING)	\
 	MEMBER(sip_peer, is_realtime, AST_DATA_BOOLEAN)		\
 	MEMBER(sip_peer, host_dynamic, AST_DATA_BOOLEAN)	\
 	MEMBER(sip_peer, autoframing, AST_DATA_BOOLEAN)		\
+	MEMBER(sip_peer, spy, AST_DATA_BOOLEAN)		\
 	MEMBER(sip_peer, inuse, AST_DATA_INTEGER)		\
 	MEMBER(sip_peer, ringing, AST_DATA_INTEGER)		\
 	MEMBER(sip_peer, onhold, AST_DATA_INTEGER)		\
@@ -34456,6 +37622,9 @@ static int load_module(void)
 	/* if the number of objects gets above MAX_XXX_BUCKETS, things will slow down */
 	peers = ao2_t_container_alloc(HASH_PEER_SIZE, peer_hash_cb, peer_cmp_cb, "allocate peers");
 	peers_by_ip = ao2_t_container_alloc(HASH_PEER_SIZE, peer_iphash_cb, peer_ipcmp_cb, "allocate peers_by_ip");
+
+	ae_providers = ao2_t_container_alloc(HASH_DIALOG_SIZE, ae_hash_cb, ae_cmp_cb, "allocate armtel event providers");
+
 	dialogs = ao2_t_container_alloc(HASH_DIALOG_SIZE, dialog_hash_cb, dialog_cmp_cb, "allocate dialogs");
 	dialogs_needdestroy = ao2_t_container_alloc(1, NULL, NULL, "allocate dialogs_needdestroy");
 	dialogs_rtpcheck = ao2_t_container_alloc(HASH_DIALOG_SIZE, dialog_hash_cb, dialog_cmp_cb, "allocate dialogs for rtpchecks");
@@ -34783,6 +37952,7 @@ static int unload_module(void)
 
 	ao2_t_ref(peers, -1, "unref the peers table");
 	ao2_t_ref(peers_by_ip, -1, "unref the peers_by_ip table");
+	ao2_t_ref(ae_providers, -1, "unref the armtel event providers table");
 	ao2_t_ref(dialogs, -1, "unref the dialogs table");
 	ao2_t_ref(dialogs_needdestroy, -1, "unref dialogs_needdestroy");
 	ao2_t_ref(dialogs_rtpcheck, -1, "unref dialogs_rtpcheck");

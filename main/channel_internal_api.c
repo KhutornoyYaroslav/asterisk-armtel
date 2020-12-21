@@ -32,6 +32,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 429061 $")
 
@@ -114,6 +115,9 @@ struct ast_channel {
 		AST_STRING_FIELD(parkinglot);   /*! Default parking lot, if empty, default parking lot  */
 		AST_STRING_FIELD(hangupsource); /*! Who is responsible for hanging up this channel */
 		AST_STRING_FIELD(dialcontext);  /*!< Dial: Extension context that we were called from */
+    //	AST_STRING_FIELD(callpriority); /*!< AICS support for SIP 'Priority:' header */
+    //	AST_STRING_FIELD(ipn20_sdp_a);  /*! AICS support for SDP 'a=sendonly' atribute */
+    //	AST_STRING_FIELD(ggs_scenario); /*! AICS support for selector/circular */
 	);
 
 	struct ast_channel_id uniqueid;		/*!< Unique Channel Identifier - can be specified on creation */
@@ -150,6 +154,8 @@ struct ast_channel {
 
 	/*! \brief Redirecting/Diversion information */
 	struct ast_party_redirecting redirecting;
+
+	struct aics_proxy_params aics_proxy;		/* AICS proxy */
 
 	struct ast_frame dtmff;				/*!< DTMF frame */
 	struct varshead varshead;			/*!< A linked list for channel variables. See \ref AstChanVar */
@@ -467,6 +473,9 @@ DEFINE_STRINGFIELD_SETTERS_FOR(call_forward, 0, 0);
 DEFINE_STRINGFIELD_SETTERS_FOR(parkinglot, 0, 0);
 DEFINE_STRINGFIELD_SETTERS_FOR(hangupsource, 0, 0);
 DEFINE_STRINGFIELD_SETTERS_FOR(dialcontext, 0, 0);
+//DEFINE_STRINGFIELD_SETTERS_FOR(callpriority, 0, 0);
+//DEFINE_STRINGFIELD_SETTERS_FOR(ipn20_sdp_a, 0, 0);
+//DEFINE_STRINGFIELD_SETTERS_FOR(ggs_scenario, 0, 0);
 
 #define DEFINE_STRINGFIELD_GETTER_FOR(field) const char *ast_channel_##field(const struct ast_channel *chan) \
 { \
@@ -484,6 +493,24 @@ DEFINE_STRINGFIELD_GETTER_FOR(call_forward);
 DEFINE_STRINGFIELD_GETTER_FOR(parkinglot);
 DEFINE_STRINGFIELD_GETTER_FOR(hangupsource);
 DEFINE_STRINGFIELD_GETTER_FOR(dialcontext);
+//DEFINE_STRINGFIELD_GETTER_FOR(callpriority);
+//DEFINE_STRINGFIELD_GETTER_FOR(ipn20_sdp_a);
+//DEFINE_STRINGFIELD_GETTER_FOR(ggs_scenario);
+
+struct aics_proxy_params *ast_channel_proxy(struct ast_channel *chan)
+{
+	if (chan)
+		return &(chan->aics_proxy);
+	else
+		return NULL;
+}
+
+void ast_channel_proxy_set(struct ast_channel *chan, struct aics_proxy_params *value)
+{
+	if (chan) {
+		aics_proxy_params_copy(&(chan->aics_proxy), value);
+	}
+}
 
 const char *ast_channel_uniqueid(const struct ast_channel *chan)
 {

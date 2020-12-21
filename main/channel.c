@@ -28,6 +28,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 429061 $")
 
@@ -819,6 +820,7 @@ struct ast_format *ast_best_codec(struct ast_format_cap *cap, struct ast_format 
 		AST_FORMAT_G729A,
 		/*! Down to G.723.1 which is proprietary but at least designed for voice */
 		AST_FORMAT_G723_1,
+		AST_FORMAT_ALAWDCN,
 	};
 	char buf[512];
 	int x;
@@ -913,6 +915,9 @@ __ast_channel_alloc_ap(int needqueue, int state, const char *cid_num, const char
 	ast_party_connected_line_init(ast_channel_connected(tmp));
 	ast_party_connected_line_init(ast_channel_connected_indicated(tmp));
 	ast_party_redirecting_init(ast_channel_redirecting(tmp));
+
+	//aics_addons_init(ast_channel_addons(tmp));
+	aics_proxy_params_init(ast_channel_proxy(tmp));
 
 	if (cid_name) {
 		ast_channel_caller(tmp)->id.name.valid = 1;
@@ -2328,6 +2333,9 @@ static void ast_channel_destructor(void *obj)
 	ast_party_connected_line_free(ast_channel_connected(chan));
 	ast_party_connected_line_free(ast_channel_connected_indicated(chan));
 	ast_party_redirecting_free(ast_channel_redirecting(chan));
+
+	//aics_addons_free(ast_channel_addons(chan));
+	aics_proxy_params_free(ast_channel_proxy(chan));
 
 	/* Close pipes if appropriate */
 	ast_channel_internal_alertpipe_close(chan);
@@ -4675,6 +4683,7 @@ int ast_indicate_data(struct ast_channel *chan, int _condition,
 	case AST_CONTROL_RECORD_STOP:
 	case AST_CONTROL_RECORD_SUSPEND:
 	case AST_CONTROL_RECORD_MUTE:
+
 		/* Nothing left to do for these. */
 		res = 0;
 		break;
@@ -6575,6 +6584,20 @@ static void channel_do_masquerade(struct ast_channel *original, struct ast_chann
 
 	/* Keep the same parkinglot. */
 	ast_channel_parkinglot_set(original, ast_channel_parkinglot(clonechan));
+
+	/* AICS support for SIP 'Priority:' header */
+	//aics_addons_copy(ast_channel_addons(clonechan), ast_channel_addons(original));
+	aics_proxy_params_copy(ast_channel_proxy(clonechan), ast_channel_proxy(original));
+//	/* Keep the same priority.  */
+//	const char *tempstr = ast_channel_callpriority(clonechan);
+//	ast_log(LOG_NOTICE, "Priority keeped '%s'\n", tempstr);
+//	ast_channel_callpriority_set(original, tempstr);
+//	/* AICS support for SDP 'a=sendonly' atribute */
+//	/* Keep the same SDP_a atribute */
+//	tempstr = ast_channel_ipn20_sdp_a(clonechan);
+//	ast_log(LOG_NOTICE, "SDP 'a' keeped '%s'\n", tempstr);
+//	ast_channel_ipn20_sdp_a_set(original, tempstr);
+	/* ~AICS */
 
 	/* Copy the FD's other than the generator fd */
 	for (x = 0; x < AST_MAX_FDS; x++) {

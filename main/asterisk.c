@@ -148,6 +148,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413588 $")
 
@@ -301,7 +302,8 @@ int daemon(int, int);  /* defined in libresolv of all places */
 
 /*! \brief Welcome message when starting a CLI interface */
 #define WELCOME_MESSAGE \
-    ast_verbose("Asterisk %s, Copyright (C) 1999 - 2013 Digium, Inc. and others.\n" \
+    ast_verbose("Armtel Intelligent Communication Server %s, Copyright (C) 2015 - 2016 Armtel, Ltd.\n", aics_get_version()); \
+	ast_verbose("Asterisk %s, Copyright (C) 1999 - 2013 Digium, Inc. and others.\n" \
                 "Created by Mark Spencer <markster@digium.com>\n" \
                 "Asterisk comes with ABSOLUTELY NO WARRANTY; type 'core show warranty' for details.\n" \
                 "This is free software, with components licensed under the GNU General Public\n" \
@@ -604,6 +606,7 @@ static char *handle_show_settings(struct ast_cli_entry *e, int cmd, struct ast_c
 
 	ast_cli(a->fd, "\nPBX Core settings\n");
 	ast_cli(a->fd, "-----------------\n");
+	ast_cli(a->fd, "  AICS version:                %s\n", aics_get_version());
 	ast_cli(a->fd, "  Version:                     %s\n", ast_get_version());
 	ast_cli(a->fd, "  Build Options:               %s\n", S_OR(AST_BUILDOPTS, "(none)"));
 	if (ast_option_maxcalls)
@@ -1480,8 +1483,8 @@ static void *netconsole(void *vconsole)
 {
 	struct console *con = vconsole;
 	char hostname[MAXHOSTNAMELEN] = "";
-	char inbuf[512];
-	char outbuf[512];
+	/*char inbuf[7168];/*/char inbuf[512];
+	/*char outbuf[7168];/*/char outbuf[512];
 	const char * const end_buf = inbuf + sizeof(inbuf);
 	char *start_read = inbuf;
 	int res;
@@ -2309,6 +2312,7 @@ static char *handle_version(struct ast_cli_entry *e, int cmd, struct ast_cli_arg
 
 	if (a->argc != 3)
 		return CLI_SHOWUSAGE;
+	ast_cli(a->fd, "AICS %s\n", aics_get_version());
 	ast_cli(a->fd, "Asterisk %s built by %s @ %s on a %s running %s on %s\n",
 		ast_get_version(), ast_build_user, ast_build_hostname,
 		ast_build_machine, ast_build_os, ast_build_date);
@@ -3341,12 +3345,14 @@ static void ast_remotecontrol(char *data)
 
 static int show_version(void)
 {
+	printf("AICS %s\n", aics_get_version());
 	printf("Asterisk %s\n", ast_get_version());
 	return 0;
 }
 
 static int show_cli_help(void)
 {
+	printf("Armtel Intelligent Communication Server %s, Copyright (C) 2015 - 2016 Armtel, Ltd.\n", aics_get_version());
 	printf("Asterisk %s, Copyright (C) 1999 - 2013, Digium, Inc. and others.\n", ast_get_version());
 	printf("Usage: asterisk [OPTIONS]\n");
 	printf("Valid Options:\n");

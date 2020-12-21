@@ -414,9 +414,31 @@ static struct ast_jb_conf global_jbconf;
 /*! \brief Typically, how many rings before we should send Caller*ID */
 #define DEFAULT_CIDRINGS 1
 
-#define AST_LAW(p) (((p)->law == DAHDI_LAW_ALAW) ? AST_FORMAT_ALAW : AST_FORMAT_ULAW)
+#ifdef PRI_ARMTEL_EXT1
+static int dahdi_armtel_law(int law)
+{
+  switch(law)
+  {
+  case SIG_PRI_ULAW: return DAHDI_LAW_MULAW;
+  case SIG_PRI_ALAW: return DAHDI_LAW_ALAW;
+  default:return DAHDI_LAW_ALAW;
+  }
+}
+static int ast_armtel_law(int law)
+ {
+   switch(law)
+   {
+   case DAHDI_LAW_ALAW: return AST_FORMAT_ALAW;
+   case DAHDI_LAW_MULAW: return AST_FORMAT_ULAW;
+   case DAHDI_LAW_ALAWDCN: return AST_FORMAT_ALAWDCN;
+   default:return AST_FORMAT_ALAW;
+   }
+ }
+ #define AST_LAW(p) ast_armtel_law((p)->law)
 
-
+#else
+ #define AST_LAW(p) (((p)->law == DAHDI_LAW_ALAW) ? AST_FORMAT_ALAW : AST_FORMAT_ULAW)
+#endif
 /*! \brief Signaling types that need to use MF detection should be placed in this macro */
 #define NEED_MFDETECT(p) (((p)->sig == SIG_FEATDMF) || ((p)->sig == SIG_FEATDMF_TA) || ((p)->sig == SIG_E911) || ((p)->sig == SIG_FGC_CAMA) || ((p)->sig == SIG_FGC_CAMAMF) || ((p)->sig == SIG_FEATB))
 
@@ -1965,6 +1987,9 @@ static void my_all_subchannels_hungup(void *pvt)
 
 	p->law = p->law_default;
 	law = p->law_default;
+#ifdef PRI_ARMTEL_EXT1
+    if(law== DAHDI_LAW_ALAWDCN)law=DAHDI_LAW_ALAW;
+#endif
 	res = ioctl(p->subs[SUB_REAL].dfd, DAHDI_SETLAW, &law);
 	if (res < 0)
 		ast_log(LOG_WARNING, "Unable to set law on channel %d to default: %s\n", p->channel, strerror(errno));
@@ -2123,6 +2148,9 @@ static struct ast_channel *my_new_analog_ast_channel(void *pvt, int state, int s
 static int dahdi_setlaw(int dfd, int law)
 {
 	int res;
+#ifdef PRI_ARMTEL_EXT1
+    if(law== DAHDI_LAW_ALAWDCN)law=DAHDI_LAW_ALAW;
+#endif
 	res = ioctl(dfd, DAHDI_SETLAW, &law);
 	if (res)
 		return res;
@@ -2174,6 +2202,12 @@ static struct ast_channel *my_new_pri_ast_channel(void *pvt, int state,
 		case SIG_PRI_ULAW:
 			newlaw = DAHDI_LAW_MULAW;
 			break;
+#ifdef PRI_ARMTEL_EXT1
+		case SIG_PRI_ALAWDCN:
+			newlaw = DAHDI_LAW_ALAWDCN;
+			break;
+
+#endif
 	}
 
 	return dahdi_new_callid_clean(p, state, 0, SUB_REAL, newlaw, assignedids, requestor, callid, callid_created);
@@ -2932,6 +2966,18 @@ static void my_module_unref(void)
 static void my_pri_init_config(void *priv, struct sig_pri_span *pri);
 #endif	/* defined(HAVE_PRI_CALL_WAITING) */
 static int dahdi_new_pri_nobch_channel(struct sig_pri_span *pri);
+#ifdef  PRI_ARMTEL_EXT
+
+static void my_armtel_channel_event(char* num ,int state )
+{
+//	if(state)ast_devstate_changed_literal(AST_DEVICE_BUSY,AST_DEVSTATE_CACHABLE,num);
+	if(state)ast_devstate_changed_literal(AST_DEVICE_INUSE,AST_DEVSTATE_CACHABLE,num);
+	else ast_devstate_changed_literal(AST_DEVICE_NOT_INUSE,AST_DEVSTATE_CACHABLE,num);
+    if(armtel_get_debug())
+  	     ast_verbose("event from Armtel: num =%s state =%d\n",num,state);
+
+}
+#endif
 
 struct sig_pri_callback sig_pri_callbacks =
 {
@@ -2963,6 +3009,10 @@ struct sig_pri_callback sig_pri_callbacks =
 	.dial_digits = my_pri_dial_digits,
 	.open_media = my_pri_ss7_open_media,
 	.ami_channel_event = my_ami_channel_event,
+#ifdef  PRI_ARMTEL_EXT
+	.armtel_channel_event = my_armtel_channel_event,
+#endif
+
 };
 #endif	/* defined(HAVE_PRI) */
 
@@ -4555,6 +4605,9 @@ static void fill_txgain(struct dahdi_gains *g, float gain, float drc, int law)
 	float linear_gain = pow(10.0, gain / 20.0);
 
 	switch (law) {
+#ifdef PRI_ARMTEL_EXT1
+	case DAHDI_LAW_ALAWDCN:
+#endif
 	case DAHDI_LAW_ALAW:
 		for (j = 0; j < ARRAY_LEN(g->txgain); j++) {
 			if (gain || drc) {
@@ -4604,6 +4657,9 @@ static void fill_rxgain(struct dahdi_gains *g, float gain, float drc, int law)
 	float linear_gain = pow(10.0, gain / 20.0);
 
 	switch (law) {
+#ifdef PRI_ARMTEL_EXT1
+	case DAHDI_LAW_ALAWDCN:
+#endif
 	case DAHDI_LAW_ALAW:
 		for (j = 0; j < ARRAY_LEN(g->rxgain); j++) {
 			if (gain || drc) {
@@ -5745,6 +5801,16 @@ static int dahdi_hangup(struct ast_channel *ast)
 	/*static int restore_gains(struct dahdi_pvt *p);*/
 	struct dahdi_pvt *p = ast_channel_tech_pvt(ast);
 	struct dahdi_params par;
+#ifdef PRI_ARMTEL_EXT1
+  char num[32];
+  char hint[32];
+  aics_num_from_name(num,ast_channel_name(ast));
+//  ast_log(LOG_WARNING, "======================= %s[%s]\n", ast_channel_name(ast),num);
+  if(armtel_get_hint(hint,num)){
+//      ast_log(LOG_WARNING, "!!!!!!!!%s!!!!!!!!!\n", hint);
+      ast_devstate_changed_literal(AST_DEVICE_NOT_INUSE,AST_DEVSTATE_CACHABLE,hint);
+   }
+#endif
 
 	ast_debug(1, "dahdi_hangup(%s)\n", ast_channel_name(ast));
 	if (!ast_channel_tech_pvt(ast)) {
@@ -5803,6 +5869,9 @@ static int dahdi_hangup(struct ast_channel *ast)
 
 		p->law = p->law_default;
 		law = p->law_default;
+#ifdef PRI_ARMTEL_EXT1
+    if(law== DAHDI_LAW_ALAWDCN)law=DAHDI_LAW_ALAW;
+#endif
 		res = ioctl(p->subs[SUB_REAL].dfd, DAHDI_SETLAW, &law);
 		if (res < 0) {
 			ast_log(LOG_WARNING, "Unable to set law on channel %d to default: %s\n",
@@ -6028,6 +6097,9 @@ static int dahdi_hangup(struct ast_channel *ast)
 
 		p->law = p->law_default;
 		law = p->law_default;
+#ifdef PRI_ARMTEL_EXT1
+    if(law== DAHDI_LAW_ALAWDCN)law=DAHDI_LAW_ALAW;
+#endif
 		res = ioctl(p->subs[SUB_REAL].dfd, DAHDI_SETLAW, &law);
 		if (res < 0)
 			ast_log(LOG_WARNING, "Unable to set law on channel %d to default: %s\n", p->channel, strerror(errno));
@@ -8157,6 +8229,7 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 	void *readbuf;
 	struct ast_frame *f;
 
+
 	/*
 	 * For analog channels, we must do deadlock avoidance because
 	 * analog ports can have more than one Asterisk channel using
@@ -8183,6 +8256,7 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 		}
 	}
 
+
 	idx = dahdi_get_index(ast, p, 0);
 
 	/* Hang up if we don't really exist */
@@ -8206,6 +8280,37 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 	p->subs[idx].f.delivery = ast_tv(0,0);
 	p->subs[idx].f.src = "dahdi_read";
 	p->subs[idx].f.data.ptr = NULL;
+#ifdef PRI_ARMTEL_EXT1
+     if(!pri_is_up(p->pri)){
+  			  p->subs[idx].f.frametype = AST_FRAME_CONTROL;
+  			  p->subs[idx].f.subclass.integer = AST_CONTROL_HANGUP;
+  			  ast_mutex_unlock(&p->lock);
+  			  return &p->subs[idx].f;
+
+
+     }
+	  struct aics_proxy_params *lp;
+	  lp=ast_channel_proxy(ast);
+	  if(lp){
+		// if(( lp->sig_armtel.cmd == AICS_ARMTEL_ASK_WORD) || ( lp->sig_armtel.cmd == AICS_ARMTEL_REMOVE_WORD) )
+	     if(( lp->sig_armtel.cmd != AICS_CMD_NONE) &&(lp->sig_armtel.send==0))
+		 {
+			  ast_log(LOG_NOTICE, "%s AICS:signaling ARMTEL cmd=%s context=%d;prio=%d\n",ast_channel_name(ast),aics_get_name_cmd(lp->sig_armtel.cmd),lp->sig_armtel.context,lp->sig_armtel.prio);
+			  p->subs[idx].f.frametype = AST_FRAME_CONTROL;
+			  p->subs[idx].f.subclass.integer = AST_CONTROL_ARMTEL_SIG;
+			  p->subs[idx].f.data.ptr =&lp->sig_armtel;
+              p->subs[idx].f.datalen =sizeof(struct aics_sig_armtel);
+			  lp->sig_armtel.send=1;
+			  ast_mutex_unlock(&p->lock);
+			  return &p->subs[idx].f;
+		 }
+	     if(lp->sig_armtel.send){
+			  ast_log(LOG_WARNING, "Not send sig ARMTEL(%s) cmd=%d \n",ast_channel_name(ast),lp->sig_armtel.cmd);
+			  lp->sig_armtel.cmd = AICS_CMD_NONE;
+			  lp->sig_armtel.send=0;
+	     }
+	  }
+#endif
 
 	/* make sure it sends initial key state as first frame */
 	if ((p->radio || (p->oprmode < 0)) && (!p->firstradio))
@@ -8355,7 +8460,10 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 				ast_log(LOG_WARNING, "Unable to set channel %d (index %d) to linear mode.\n", p->channel, idx);
 		}
 	} else if ((ast_channel_rawreadformat(ast)->id == AST_FORMAT_ULAW) ||
-		(ast_channel_rawreadformat(ast)->id == AST_FORMAT_ALAW)) {
+#ifdef PRI_ARMTEL_EXT1
+			(ast_channel_rawreadformat(ast)->id == AST_FORMAT_ALAWDCN) ||
+#endif
+			(ast_channel_rawreadformat(ast)->id == AST_FORMAT_ALAW)) {
 		if (p->subs[idx].linear) {
 			p->subs[idx].linear = 0;
 			res = dahdi_setlinear(p->subs[idx].dfd, p->subs[idx].linear);
@@ -8369,7 +8477,30 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 	}
 	readbuf = ((unsigned char *)p->subs[idx].buffer) + AST_FRIENDLY_OFFSET;
 	CHECK_BLOCKING(ast);
+#ifdef PRI_ARMTEL_EXT1
+	if(ast_channel_rawreadformat(ast)->id == AST_FORMAT_ALAWDCN)
+	{
+	  unsigned char tmpbuf[READ_SIZE * 2],*ptmp=((unsigned char *)p->subs[idx].buffer) + AST_FRIENDLY_OFFSET;
+	  unsigned short i;
+	  res = read(p->subs[idx].dfd, tmpbuf, p->subs[idx].linear ? READ_SIZE * 2 : READ_SIZE);
+	  for(i=0 ;i<res; i++) {	*ptmp= tmpbuf[i];ptmp+=2;}
+//  for resample(2 timeslot from 1 timeslot   )use ast_channel_oldwriteformat !!!!!!!!!!!!!!
+	 ptmp=(unsigned char *)(p->subs[idx].buffer) + AST_FRIENDLY_OFFSET ;ptmp+=1;
+	  if(ast_channel_oldwriteformat(ast)->id !=AST_FORMAT_ALAW){
+		     res = read(p->next->subs[idx].dfd, tmpbuf, p->subs[idx].linear ? READ_SIZE * 2 : READ_SIZE);
+	  }
+//	  else{
+//				 ast_log(LOG_WARNING, "--resample=%d\n",ast_channel_oldwriteformat(ast)->id);
+//	  }
+	  for(i=0 ;i<res; i++) {*ptmp= tmpbuf[i];ptmp+=2;}
+//	  ast_log(LOG_WARNING, "--dahdi_read=%d[0=%X;1=%X[%X];2=%X;3=%X[%X]{%X;%X;%X}\n",res,ptmp[0],ptmp[1],tmpbuf[0],ptmp[2],ptmp[3],tmpbuf[1],&ptmp[0],&ptmp[1],ptmp+1);
+	}
+	else{
+		res = read(p->subs[idx].dfd, readbuf, p->subs[idx].linear ? READ_SIZE * 2 : READ_SIZE);
+	}
+#else
 	res = read(p->subs[idx].dfd, readbuf, p->subs[idx].linear ? READ_SIZE * 2 : READ_SIZE);
+#endif
 	ast_clear_flag(ast_channel_flags(ast), AST_FLAG_BLOCKING);
 	/* Check for hangup */
 	if (res < 0) {
@@ -8460,6 +8591,12 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 	p->subs[idx].f.mallocd = 0;
 	p->subs[idx].f.offset = AST_FRIENDLY_OFFSET;
 	p->subs[idx].f.data.ptr = p->subs[idx].buffer + AST_FRIENDLY_OFFSET / sizeof(p->subs[idx].buffer[0]);
+#ifdef PRI_ARMTEL_EXT1
+	if(ast_channel_rawreadformat(ast)->id == AST_FORMAT_ALAWDCN){
+		p->subs[idx].f.samples=p->subs[idx].f.samples*2;
+		p->subs[idx].f.datalen=p->subs[idx].f.datalen*2;
+	}
+#endif
 #if 0
 	ast_debug(1, "Read %d of voice on %s\n", p->subs[idx].f.datalen, ast->name);
 #endif
@@ -8594,7 +8731,6 @@ static struct ast_frame *dahdi_read(struct ast_channel *ast)
 			break;
 		}
 	}
-
 	ast_mutex_unlock(&p->lock);
 	return f;
 }
@@ -8640,6 +8776,9 @@ static int dahdi_write(struct ast_channel *ast, struct ast_frame *frame)
 	}
 	if ((frame->subclass.format.id != AST_FORMAT_SLINEAR) &&
 		(frame->subclass.format.id != AST_FORMAT_ULAW) &&
+#ifdef PRI_ARMTEL_EXT1
+		(frame->subclass.format.id != AST_FORMAT_ALAWDCN) &&
+#endif
 		(frame->subclass.format.id != AST_FORMAT_ALAW)) {
 		ast_log(LOG_WARNING, "Cannot handle frames in %s format\n", ast_getformatname(&frame->subclass.format));
 		return -1;
@@ -8677,7 +8816,25 @@ static int dahdi_write(struct ast_channel *ast, struct ast_frame *frame)
 			if (res)
 				ast_log(LOG_WARNING, "Unable to set companded mode on channel %d\n", p->channel);
 		}
-		res = my_dahdi_write(p, (unsigned char *)frame->data.ptr, frame->datalen, idx, 0);
+#ifdef PRI_ARMTEL_EXT1
+        if(frame->subclass.format.id == AST_FORMAT_ALAWDCN){
+      	  unsigned char tmpbuf[READ_SIZE * 2],*ptmp=(unsigned char *)frame->data.ptr;
+      	  unsigned short i;
+    	  for(i=0 ;i< READ_SIZE; i++) {	tmpbuf[i]=*ptmp;ptmp+=2;}
+ 		  res = write(p->subs[idx].dfd, tmpbuf, READ_SIZE);
+		  ptmp=(unsigned char *)frame->data.ptr;ptmp+=1;
+    	  for(i=0 ;i< READ_SIZE; i++) {	tmpbuf[i]=*ptmp;ptmp+=2;}
+		  res = write(p->next->subs[idx].dfd, tmpbuf, READ_SIZE);
+	//	 ast_log(LOG_WARNING, "dahdi_write=%d[len=%d;codec=%d]\n",res,frame->datalen,frame->subclass.format.id );
+        }
+        else{
+		  res = my_dahdi_write(p, (unsigned char *)frame->data.ptr, frame->datalen, idx, 0);
+//		 ast_log(LOG_WARNING, "dahdi_write[len=%d;codec=%d]\n",frame->datalen,frame->subclass.format.id );
+        }
+#else
+		  res = my_dahdi_write(p, (unsigned char *)frame->data.ptr, frame->datalen, idx, 0);
+
+#endif
 	}
 	if (res < 0) {
 		ast_log(LOG_WARNING, "write failed: %s\n", strerror(errno));
@@ -8692,9 +8849,49 @@ static int dahdi_indicate(struct ast_channel *chan, int condition, const void *d
 	int res=-1;
 	int idx;
 	int func = DAHDI_FLASH;
+//	struct aics_proxy_params *abc ;
+	struct sig_pri_chan *spc;
+	struct aics_sig_armtel *sig;
+
 
 	ast_mutex_lock(&p->lock);
 	ast_debug(1, "Requested indication %d on channel %s\n", condition, ast_channel_name(chan));
+
+#ifdef PRI_ARMTEL_EXT1
+	  if(condition== AST_CONTROL_ARMTEL_INTERCOM_SIG){
+		if(data){
+			 sig =(struct aics_sig_armtel*)data;
+			 spc=p->sig_pvt;
+			  ast_log(LOG_NOTICE, "%s AICS:signaling ARMTEL cmd=%s context=%d;prio=%d\n",ast_channel_name(chan),aics_get_name_cmd(sig->cmd),sig->context,sig->prio);
+		     switch(sig->cmd){
+		     case AICS_ARMTEL_ASK_WORD:
+		      pri_send_armtel_ask_word(spc->pri->pri,spc->call,sig->prio,sig->context);
+//			  ast_log(LOG_WARNING, "ASK_WORD context=%d;prio=%d \n",sig->context,sig->prio);
+			  break;
+		     case AICS_ARMTEL_REMOVE_WORD:
+		      pri_send_armtel_remove_word(spc->pri->pri,spc->call,sig->prio,sig->context);
+//			  ast_log(LOG_WARNING, "REMOVE_WORD context=%d;prio=%d \n",sig->context,sig->prio);
+			  break;
+		     case AICS_ARMTEL_INTERRUPT_WORD:
+		      pri_send_armtel_interrupt_word(spc->pri->pri,spc->call,sig->prio,sig->context);
+			  break;
+		     case AICS_ARMTEL_DIRECTION:
+			  pri_send_armtel_direction(spc->pri->pri,spc->call,sig->context);
+//			  ast_log(LOG_WARNING, "DIRECTION context=%d \n",sig->context);
+			  break;
+		     case AICS_ARMTEL_DISKRET3:
+		      pri_send_armtel_diskret3(spc->pri->pri,spc->call);
+			  break;
+		     case AICS_ARMTEL_CHANGE_STATE_CONF:
+		      pri_send_armtel_change_state_conf (spc->pri->pri,spc->call,sig->context);
+			  break;
+		     }
+		}
+//		 ast_log(LOG_WARNING, "AST_CONTROL_ARMTEL_SIGd=%d ptr=%X;\n",datalen,data);
+	  }
+#endif
+
+
 	switch (p->sig) {
 #if defined(HAVE_PRI)
 	case SIG_PRI_LIB_HANDLE_CASES:
@@ -8917,15 +9114,29 @@ static struct ast_channel *dahdi_new(struct dahdi_pvt *i, int state, int startpb
 		i->law = law;
 		if (law == DAHDI_LAW_ALAW) {
 			ast_format_set(&deflaw, AST_FORMAT_ALAW, 0);
+#ifdef PRI_ARMTEL_EXT1
+		}
+		else if (law == DAHDI_LAW_ALAWDCN) {
+			ast_format_set(&deflaw, AST_FORMAT_ALAWDCN, 0);
+#endif
 		} else {
 			ast_format_set(&deflaw, AST_FORMAT_ULAW, 0);
 		}
+
 	} else {
 		switch (i->sig) {
 		case SIG_PRI_LIB_HANDLE_CASES:
+#ifdef PRI_ARMTEL_EXT1
+			if(armtel_get_bandwidth()){
+				i->law =DAHDI_LAW_ALAWDCN;
+				i->law_default=DAHDI_LAW_ALAWDCN;
+			}
+			else{
 			/* Make sure companding law is known. */
 			i->law = (i->law_default == DAHDI_LAW_ALAW)
 				? DAHDI_LAW_ALAW : DAHDI_LAW_MULAW;
+			}
+#endif
 			break;
 		default:
 			i->law = i->law_default;
@@ -8933,6 +9144,11 @@ static struct ast_channel *dahdi_new(struct dahdi_pvt *i, int state, int startpb
 		}
 		if (i->law_default == DAHDI_LAW_ALAW) {
 			ast_format_set(&deflaw, AST_FORMAT_ALAW, 0);
+#ifdef PRI_ARMTEL_EXT1
+		}
+		else if (i->law_default == DAHDI_LAW_ALAWDCN) {
+			ast_format_set(&deflaw, AST_FORMAT_ALAWDCN, 0);
+#endif
 		} else {
 			ast_format_set(&deflaw, AST_FORMAT_ULAW, 0);
 		}
@@ -13164,6 +13380,8 @@ static struct ast_channel *dahdi_request(const char *type, struct ast_format_cap
 	struct ast_callid *callid = NULL;
 	int callid_created = ast_callid_threadstorage_auto(&callid);
 
+
+
 	ast_mutex_lock(&iflock);
 	p = determine_starting_point(data, &start);
 	if (!p) {
@@ -13178,11 +13396,28 @@ static struct ast_channel *dahdi_request(const char *type, struct ast_format_cap
 	while (p && !tmp) {
 		if (start.roundrobin)
 			round_robin[start.rr_starting_point] = p;
+#ifdef PRI_ARMTEL_EXT1
+		if(armtel_get_bandwidth() !=  0){
+            if(p->channel < 16){
+        	  if(!(p->channel & 1)) {
+        		  goto next_armtel;
+        	  }
+            }
+            else if(p->channel < 31){
+        	    if(p->channel & 1){
+        	    	goto next_armtel;
+        	    }
+            }
+            else {
+            	goto next_armtel;
+            }
+         //   ast_log(LOG_WARNING, "dahdi_request[chan=%d;bandwidth=%d]\n",p->channel,armtel_get_bandwidth());
+		}
+#endif
 
 		if (is_group_or_channel_match(p, start.span, start.groupmatch, &groupmatched, start.channelmatch, &channelmatched)
 			&& available(&p, channelmatched)) {
 			ast_debug(1, "Using channel %d\n", p->channel);
-
 			callwait = (p->owner != NULL);
 #ifdef HAVE_OPENR2
 			if (p->mfcr2) {
@@ -13244,6 +13479,7 @@ static struct ast_channel *dahdi_request(const char *type, struct ast_format_cap
 				sig_pri_extract_called_num_subaddr(p->sig_pvt, data, p->dnid,
 					sizeof(p->dnid));
 				tmp = sig_pri_request(p->sig_pvt, SIG_PRI_DEFLAW, assignedids, requestor, transcapdigital);
+
 #endif
 #if defined(HAVE_SS7)
 			} else if (p->sig == SIG_SS7) {
@@ -13252,6 +13488,7 @@ static struct ast_channel *dahdi_request(const char *type, struct ast_format_cap
 			} else {
 				tmp = dahdi_new(p, AST_STATE_RESERVED, 0, p->owner ? SUB_CALLWAIT : SUB_REAL, 0, assignedids, requestor, callid);
 			}
+
 			if (!tmp) {
 				p->outgoing = 0;
 #if defined(HAVE_PRI)
@@ -13281,6 +13518,11 @@ static struct ast_channel *dahdi_request(const char *type, struct ast_format_cap
 #ifdef HAVE_OPENR2
 next:
 #endif
+#ifdef PRI_ARMTEL_EXT1
+next_armtel:
+#endif
+
+
 		if (start.backwards) {
 			p = p->prev;
 			if (!p)
@@ -13310,6 +13552,26 @@ next:
 	}
 
 	ast_callid_threadstorage_auto_clean(callid, callid_created);
+#ifdef PRI_ARMTEL_EXT1
+	if((tmp !=NULL) && (requestor!=NULL)){
+
+	 struct aics_proxy_params *aipr,*aipm;
+	 aipm = ast_channel_proxy(tmp);
+	 aipr = ast_channel_proxy(requestor);
+	 if((aipm !=NULL)&&(aipr !=NULL)) {
+		aics_proxy_params_copy(aipm,aipr);
+		if((aipr->scenario == AICS_SCENARIO_SELECTOR) ||
+		   (aipr->scenario == AICS_SCENARIO_GROUP) ||
+		   (aipr->scenario == AICS_SCENARIO_CONFERENCE) ||
+		   (aipr->scenario == AICS_SCENARIO_CIRCULAR)){
+			aipm->is_member=1;
+		}
+	    ast_log(LOG_NOTICE, "%s AICS: params_copy  requestor=%s\n",ast_channel_name(tmp),ast_channel_name(requestor));
+	 }
+	}
+#endif
+//	 ast_log(LOG_WARNING, "dahdi=null\n");
+
 	return tmp;
 }
 
@@ -14301,6 +14563,65 @@ static char *handle_pri_version(struct ast_cli_entry *e, int cmd, struct ast_cli
 	return CLI_SUCCESS;
 }
 #endif	/* defined(HAVE_PRI) */
+#ifdef PRI_ARMTEL_EXT
+static char *handle_armtel_show(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "pri armtel show";
+		e->usage =
+				"Usage: pri armtel show\n"
+			    "Displays armtel information\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	}
+	armtel_show();
+	return CLI_SUCCESS;
+}
+static char *handle_armtel_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+
+		switch (cmd) {
+		case CLI_INIT:
+			e->command = "pri armtel reload";
+			e->usage =
+					"Usage: pri armtel reload\n"
+				    "Reload armtel configuration\n";
+			return NULL;
+		case CLI_GENERATE:
+			return NULL;
+		}
+		armtel_reload();
+		return CLI_SUCCESS;
+}
+static char *handle_armtel_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+
+	int state=0;
+		switch (cmd) {
+		case CLI_INIT:
+			e->command = "pri armtel debug {on|off}";
+			e->usage =
+					"Usage: pri armtel debug on|off\n"
+				    " Enables debugging armtel DSS extension\n";
+			return NULL;
+		case CLI_GENERATE:
+			return NULL;
+		}
+
+		if (!strcasecmp(a->argv[3], "on")) {
+			state = 1;
+		} else if (!strcasecmp(a->argv[3], "off")) {
+			state = 0;
+
+		}
+		armtel_debug(state);
+		return CLI_SUCCESS;
+}
+#endif
+
 
 #if defined(HAVE_PRI)
 static struct ast_cli_entry dahdi_pri_cli[] = {
@@ -14316,6 +14637,12 @@ static struct ast_cli_entry dahdi_pri_cli[] = {
 	AST_CLI_DEFINE(handle_pri_show_debug, "Displays current PRI debug settings"),
 	AST_CLI_DEFINE(handle_pri_set_debug_file, "Sends PRI debug output to the specified file"),
 	AST_CLI_DEFINE(handle_pri_version, "Displays libpri version"),
+#ifdef PRI_ARMTEL_EXT
+	AST_CLI_DEFINE(handle_armtel_show, "Displays armtel information"),
+	AST_CLI_DEFINE(handle_armtel_reload, "Reload armtel configuration"),
+	AST_CLI_DEFINE(handle_armtel_debug, "Enables armtel debug {on|off}"),
+#endif
+
 };
 #endif	/* defined(HAVE_PRI) */
 
@@ -18113,6 +18440,9 @@ static int setup_dahdi_int(int reload, struct dahdi_chan_conf *default_conf, str
 #endif
 	int have_cfg_now;
 	static int had_cfg_before = 1;/* So initial load will complain if we don't have cfg. */
+#ifdef PRI_ARMTEL_EXT
+	armtel_load(ARMTEL_FILE_CONFIG,reload);
+#endif
 
 	cfg = ast_config_load(config, config_flags);
 	have_cfg_now = !!cfg;
@@ -18574,6 +18904,7 @@ static int load_module(void)
 	int y;
 #endif	/* defined(HAVE_PRI) || defined(HAVE_SS7) */
 
+
 	if (STASIS_MESSAGE_TYPE_INIT(dahdichannel_type)) {
 		return AST_MODULE_LOAD_FAILURE;
 	}
@@ -18584,7 +18915,9 @@ static int load_module(void)
 	ast_format_cap_add(dahdi_tech.capabilities, ast_format_set(&tmpfmt, AST_FORMAT_SLINEAR, 0));
 	ast_format_cap_add(dahdi_tech.capabilities, ast_format_set(&tmpfmt, AST_FORMAT_ULAW, 0));
 	ast_format_cap_add(dahdi_tech.capabilities, ast_format_set(&tmpfmt, AST_FORMAT_ALAW, 0));
-
+#ifdef PRI_ARMTEL_EXT1
+	ast_format_cap_add(dahdi_tech.capabilities, ast_format_set(&tmpfmt, AST_FORMAT_ALAWDCN, 0));
+#endif
 	if (dahdi_native_load(ast_module_info->self, &dahdi_tech)) {
 		return AST_MODULE_LOAD_FAILURE;
 	}
@@ -18805,6 +19138,7 @@ static int reload(void)
  */
 
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_LOAD_ORDER, tdesc,
+//AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_GLOBAL_SYMBOLS, tdesc,
 	.load = load_module,
 	.unload = unload_module,
 	.reload = reload,

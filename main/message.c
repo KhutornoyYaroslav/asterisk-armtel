@@ -28,6 +28,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 424691 $")
 
@@ -979,6 +980,22 @@ static int msg_func_read(struct ast_channel *chan, const char *function,
 		ast_copy_string(buf, msg->from, len);
 	} else if (!strcasecmp(data, "body")) {
 		ast_copy_string(buf, msg->body, len);
+	} else if (!strncasecmp(data, "armtel_", 7)) {
+
+		if (!strcasecmp(data, "armtel_priority")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_PRIORITY));
+		} else if (!strcasecmp(data, "armtel_direction")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_ARMTEL_DIRECTION));
+		} else if (!strcasecmp(data, "armtel_scenario")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_ARMTEL_SCENARIO));
+		} else if (!strcasecmp(data, "armtel_playlist")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_ARMTEL_PLAYLIST));
+		} else if (!strcasecmp(data, "armtel_relay")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_ARMTEL_RELAY));
+		} else if (!strcasecmp(data, "armtel_event")) {
+			snprintf(buf, len, "%s", ast_msg_get_var(msg, H_ARMTEL_EVENT));
+		}
+
 	} else {
 		ast_log(LOG_WARNING, "Invalid argument to MESSAGE(): '%s'\n", data);
 	}
@@ -1019,6 +1036,23 @@ static int msg_func_write(struct ast_channel *chan, const char *function,
 		ast_msg_set_from(msg, "%s", value);
 	} else if (!strcasecmp(data, "body")) {
 		ast_msg_set_body(msg, "%s", value);
+	} else if (!strncasecmp(data, "armtel_", 7)) {
+		if (!value) {
+			return -1;
+		}
+		if (!strcasecmp(data, "armtel_priority")) {
+			ast_msg_set_var(msg, H_PRIORITY, value);
+		} else if (!strcasecmp(data, "armtel_direction")) {
+			ast_msg_set_var(msg, H_ARMTEL_DIRECTION, value);
+		} else if (!strcasecmp(data, "armtel_scenario")) {
+			ast_msg_set_var(msg, H_ARMTEL_SCENARIO, value);
+		} else if (!strcasecmp(data, "armtel_playlist")) {
+			ast_msg_set_var(msg, H_ARMTEL_PLAYLIST, value);
+		} else if (!strcasecmp(data, "armtel_relay")) {
+			ast_msg_set_var(msg, H_ARMTEL_RELAY, value);
+		} else if (!strcasecmp(data, "armtel_event")) {
+			ast_msg_set_var(msg, H_ARMTEL_EVENT, value);
+		}
 	} else if (!strcasecmp(data, "custom_data")) {
 		int outbound = -1;
 		if (!strcasecmp(value, "mark_all_outbound")) {

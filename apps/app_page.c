@@ -44,6 +44,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 410157 $")
 #include "asterisk/devicestate.h"
 #include "asterisk/dial.h"
 
+#include "aics.h"
 /*** DOCUMENTATION
 	<application name="Page" language="en_US">
 		<synopsis>
@@ -118,11 +119,14 @@ enum page_opt_flags {
 	PAGE_IGNORE_FORWARDS = (1 << 4),
 	PAGE_ANNOUNCE = (1 << 5),
 	PAGE_NOCALLERANNOUNCE = (1 << 6),
+	PAGE_IPN20_ANNOUNCE = (1 << 7),
 };
 
 enum {
 	OPT_ARG_ANNOUNCE = 0,
-	OPT_ARG_ARRAY_SIZE = 1,
+	OPT_ARG_IPN20_ANNOUNCE,
+	/* last entry */
+	OPT_ARG_ARRAY_SIZE,
 };
 
 AST_APP_OPTIONS(page_opts, {
@@ -133,6 +137,7 @@ AST_APP_OPTIONS(page_opts, {
 	AST_APP_OPTION('i', PAGE_IGNORE_FORWARDS),
 	AST_APP_OPTION_ARG('A', PAGE_ANNOUNCE, OPT_ARG_ANNOUNCE),
 	AST_APP_OPTION('n', PAGE_NOCALLERANNOUNCE),
+	AST_APP_OPTION_ARG('Q', PAGE_IPN20_ANNOUNCE, OPT_ARG_IPN20_ANNOUNCE),
 });
 
 /* We use this structure as a way to pass this to all dialed channels */
@@ -181,6 +186,10 @@ static void setup_profile_paged(struct ast_channel *chan, struct page_options *o
 		&& !ast_strlen_zero(options->opts[OPT_ARG_ANNOUNCE])) {
 		ast_func_write(chan, "CONFBRIDGE(user,announcement)", options->opts[OPT_ARG_ANNOUNCE]);
 	}
+	if (ast_test_flag(&options->flags, PAGE_IPN20_ANNOUNCE)
+		&& !ast_strlen_zero(options->opts[OPT_ARG_IPN20_ANNOUNCE])) {
+		ast_func_write(chan, "CONFBRIDGE(user,ipn20_announce)", options->opts[OPT_ARG_IPN20_ANNOUNCE]);
+	}
 }
 
 /*!
@@ -202,6 +211,11 @@ static void setup_profile_caller(struct ast_channel *chan, struct page_options *
 		&& ast_test_flag(&options->flags, PAGE_ANNOUNCE)
 		&& !ast_strlen_zero(options->opts[OPT_ARG_ANNOUNCE])) {
 		ast_func_write(chan, "CONFBRIDGE(user,announcement)", options->opts[OPT_ARG_ANNOUNCE]);
+	}
+	if (!ast_test_flag(&options->flags, PAGE_NOCALLERANNOUNCE)
+		&& ast_test_flag(&options->flags, PAGE_IPN20_ANNOUNCE)
+		&& !ast_strlen_zero(options->opts[OPT_ARG_IPN20_ANNOUNCE])) {
+		ast_func_write(chan, "CONFBRIDGE(user,ipn20_announce)", options->opts[OPT_ARG_IPN20_ANNOUNCE]);
 	}
 }
 
@@ -249,6 +263,7 @@ static int page_exec(struct ast_channel *chan, const char *data)
 		return -1;
 	};
 
+
 	parse = ast_strdupa(data);
 
 	AST_STANDARD_APP_ARGS(args, parse);
@@ -267,7 +282,20 @@ static int page_exec(struct ast_channel *chan, const char *data)
 	}
 
 	snprintf(confbridgeopts, sizeof(confbridgeopts), "ConfBridge,%u", confid);
-
+	/* AICS addons support */
+   struct aics_proxy_params *abc = ast_channel_proxy(chan);
+   if((abc) && (abc->scenario ==AICS_SCENARIO_NONE)){
+   		if (ast_test_flag(&options.flags, PAGE_DUPLEX)) {
+   		  abc->scenario=AICS_SCENARIO_CONFERENCE;
+   		  abc->direction=AICS_DIRECTION_DUPLEX;
+   		}
+   		else{
+   //		  abc->scenario=AICS_SCENARIO_CIRCULAR;
+   		  abc->scenario=AICS_SCENARIO_GROUP;
+   //		  abc->direction=AICS_DIRECTION_SEND;
+   		}
+    }
+   	/* AICS addons support */
 	/* Count number of extensions in list by number of ampersands + 1 */
 	num_dials = 1;
 	tmp = args.devices;
@@ -362,13 +390,10 @@ static int page_exec(struct ast_channel *chan, const char *data)
 	/* Go through each dial attempt cancelling, joining, and destroying */
 	for (i = 0; i < pos; i++) {
 		struct ast_dial *dial = dial_list[i];
-
 		/* We have to wait for the async thread to exit as it's possible ConfBridge won't throw them out immediately */
 		ast_dial_join(dial);
-
 		/* Hangup all channels */
 		ast_dial_hangup(dial);
-
 		/* Destroy dialing structure */
 		ast_dial_destroy(dial);
 	}

@@ -275,6 +275,10 @@ struct ast_bridge_features {
 	unsigned int mute:1;
 	/*! TRUE if DTMF should be passed into the bridge tech.  */
 	unsigned int dtmf_passthrough:1;
+	/* AICS addons support */
+	unsigned int ast_write_block:1;
+	/*~ AICS  */
+
 };
 
 /*!

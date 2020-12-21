@@ -3923,6 +3923,9 @@ DECLARE_STRINGFIELD_SETTERS_FOR(linkedid);
 DECLARE_STRINGFIELD_SETTERS_FOR(parkinglot);
 DECLARE_STRINGFIELD_SETTERS_FOR(hangupsource);
 DECLARE_STRINGFIELD_SETTERS_FOR(dialcontext);
+//DECLARE_STRINGFIELD_SETTERS_FOR(callpriority);
+//DECLARE_STRINGFIELD_SETTERS_FOR(ipn20_sdp_a);
+//DECLARE_STRINGFIELD_SETTERS_FOR(ggs_scenario);
 
 const char *ast_channel_name(const struct ast_channel *chan);
 const char *ast_channel_language(const struct ast_channel *chan);
@@ -3937,6 +3940,9 @@ const char *ast_channel_linkedid(const struct ast_channel *chan);
 const char *ast_channel_parkinglot(const struct ast_channel *chan);
 const char *ast_channel_hangupsource(const struct ast_channel *chan);
 const char *ast_channel_dialcontext(const struct ast_channel *chan);
+//const char *ast_channel_callpriority(const struct ast_channel *chan);
+//const char *ast_channel_ipn20_sdp_a(const struct ast_channel *chan);
+//const char *ast_channel_ggs_scenario(const struct ast_channel *chan);
 
 const char *ast_channel_appl(const struct ast_channel *chan);
 void ast_channel_appl_set(struct ast_channel *chan, const char *value);
@@ -4084,6 +4090,11 @@ struct ast_party_id ast_channel_redirecting_effective_to(struct ast_channel *cha
 struct timeval *ast_channel_dtmf_tv(struct ast_channel *chan);
 struct timeval *ast_channel_whentohangup(struct ast_channel *chan);
 struct varshead *ast_channel_varshead(struct ast_channel *chan);
+
+//struct aics_channel_addons *ast_channel_addons(struct ast_channel *chan);
+//void ast_channel_addons_set(struct ast_channel *chan, struct aics_channel_addons *value);
+struct aics_proxy_params *ast_channel_proxy(struct ast_channel *chan);
+void ast_channel_proxy_set(struct ast_channel *chan, struct aics_proxy_params *value);
 
 void ast_channel_dtmff_set(struct ast_channel *chan, struct ast_frame *value);
 void ast_channel_jb_set(struct ast_channel *chan, struct ast_jb *value);

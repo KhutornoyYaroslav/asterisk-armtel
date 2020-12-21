@@ -41,6 +41,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 427275 $")
 #include "asterisk/cli.h"
 #include "asterisk/channel.h"	/* AST_MAX_EXTENSION */
 #include "asterisk/callerid.h"
+#include "asterisk/astdb.h"
 
 static const char config[] = "extensions.conf";
 static const char registrar[] = "pbx_config";
@@ -1893,6 +1894,15 @@ static int load_module(void)
 
 	if (pbx_load_module())
 		return AST_MODULE_LOAD_DECLINE;
+
+	/* AICS clear conferences */
+	const char *db_family_admin = pbx_builtin_getvar_helper(NULL, "AICS_DB_ADMIN");
+	const char *db_family_conf = pbx_builtin_getvar_helper(NULL, "AICS_DB_CONF");
+	if (db_family_admin)
+		ast_db_deltree(db_family_admin, NULL);
+	if (db_family_conf)
+		ast_db_deltree(db_family_conf, NULL);
+	/* ~AICS */
 
 	return AST_MODULE_LOAD_SUCCESS;
 }

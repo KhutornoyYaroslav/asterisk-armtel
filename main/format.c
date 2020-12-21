@@ -797,6 +797,10 @@ int ast_format_rate(const struct ast_format *format)
 	/* Opus */
 	case AST_FORMAT_OPUS:
 		return 48000;
+#ifdef	ARMTEL_CODEC_DCN
+	case AST_FORMAT_ALAWDCN:
+		return 16000;
+#endif
 	default:
 		return 8000;
 	}
@@ -1102,6 +1106,10 @@ static int format_list_init(void)
 
 	/* Opus (FIXME: real min is 3/5/10, real max is 120...) */
 	format_list_add_static(ast_format_set(&tmpfmt, AST_FORMAT_OPUS, 0), "opus", 48000, "Opus Codec", 10, 20, 60, 20, 20, 0, 0);   /*!< codec_opus.c */
+
+#ifdef ARMTEL_CODEC_DCN
+	format_list_add_static(ast_format_set(&tmpfmt, AST_FORMAT_ALAWDCN, 0), "alawdcn", 16000, "G.711 A-law(ARMTEL DCN)", 320, 0, 150, 20, 20, 0, 0);     /*!< codec_alawdcn.c */
+#endif
 	/* VP8 (passthrough) */
 	format_list_add_static(ast_format_set(&tmpfmt, AST_FORMAT_VP8, 0), "vp8", 0, "VP8 Video", 0, 0, 0, 0 ,0 ,0, 0);         /*!< Passthrough support, see format_h263.c */
 

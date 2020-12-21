@@ -31,6 +31,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428601 $")
 
@@ -2082,6 +2083,59 @@ static void bridge_channel_handle_control(struct ast_bridge_channel *bridge_chan
 		/* Should never happen. */
 		ast_assert(0);
 		break;
+/* AICS addons support */
+    case AST_CONTROL_ARMTEL_SIG:
+       {
+    // это поддержка одностороннего управления ( с управлением RTP)
+		struct aics_sig_armtel *sig=(struct aics_sig_armtel*)fr->data.ptr;
+ 	          		struct ast_bridge_channel *bc;
+        if(sig){
+
+//           struct aics_proxy_params *abc = ast_channel_proxy(bridge_channel->chan);
+ //  	      ast_log(LOG_ERROR, "%s AICS:3333signaling ARMTEL cmd=%s context=%d;prio=%d,send=%d\n",ast_channel_name(bridge_channel->chan),aics_get_name_cmd(abc->sig_armtel.cmd),abc->sig_armtel.context,abc->sig_armtel.prio,abc->sig_armtel.send);
+ //  	      ast_log(LOG_ERROR, "%s AICS:111signaling ARMTEL cmd=%s context=%d;prio=%d,send=%d\n",ast_channel_name(bridge_channel->chan),aics_get_name_cmd(sig->cmd),sig->context,sig->prio,sig->send);
+		  if(sig->cmd==AICS_ARMTEL_DIRECTION){
+		   if(sig->context==AICS_CONTEXT_ARMTEL_ACT_SPEAK){
+ 	          	ast_bridge_channel_lock(bridge_channel);
+	               AST_LIST_TRAVERSE(&bridge_channel->bridge->channels, bc, entry) {
+		              bc->features->mute=1;
+                  //    ast_log(LOG_NOTICE, "!!!!(%s)####;\n",ast_channel_name(bc->chan));
+	               }
+	            bridge_channel->features->mute=0;
+                ast_bridge_channel_unlock(bridge_channel);
+        //    ast_log(LOG_WARNING, "!!!!_SPEAK(%s);\n",ast_channel_name(bridge_channel->chan));
+		   }
+		   else if (sig->context==AICS_CONTEXT_ARMTEL_ACT_LISTEN){
+ 	         ast_bridge_channel_lock(bridge_channel);
+	               AST_LIST_TRAVERSE(&bridge_channel->bridge->channels, bc, entry) {
+		              bc->features->mute=0;
+	               }
+	         bridge_channel->features->mute=1;
+             ast_bridge_channel_unlock(bridge_channel);
+        //    ast_log(LOG_WARNING, "!!!!_LISTEN(%s);\n",ast_channel_name(bridge_channel->chan));
+		   }
+		   else if (sig->context==AICS_CONTEXT_ARMTEL_ACT_LISTEN_BTN_OFF){
+ 	         ast_bridge_channel_lock(bridge_channel);
+	               AST_LIST_TRAVERSE(&bridge_channel->bridge->channels, bc, entry) {
+		              bc->features->mute=0;
+	               }
+	         bridge_channel->features->mute=1;
+             ast_bridge_channel_unlock(bridge_channel);
+       //     ast_log(LOG_WARNING, "!!!!__LISTEN_BTN_OFF(%s);\n",ast_channel_name(bridge_channel->chan));
+		   }
+          }
+		  ast_indicate_data(chan, AST_CONTROL_ARMTEL_INTERCOM_SIG, fr->data.ptr, fr->datalen);
+//          abc->sig_armtel.cmd = AICS_CMD_NONE;
+//          abc->sig_armtel.send=0;
+//          sig->cmd = AICS_CMD_NONE;
+//		  sig->send=0;
+//	      ast_log(LOG_ERROR, "%s AICS:signaling ARMTEL cmd=%s context=%d;prio=%d,send=%d\n",ast_channel_name(bridge_channel->chan),aics_get_name_cmd(sig->cmd),sig->context,sig->prio,sig->send);
+
+		}
+		}
+		break;
+/* AICS addons support */
+
 	default:
 		ast_indicate_data(chan, fr->subclass.integer, fr->data.ptr, fr->datalen);
 		break;
@@ -2178,7 +2232,11 @@ static void bridge_channel_handle_write(struct ast_bridge_channel *bridge_channe
 	default:
 		/* Write the frame to the channel. */
 		bridge_channel->activity = BRIDGE_CHANNEL_THREAD_SIMPLE;
-		ast_write(bridge_channel->chan, fr);
+		/* AICS addons support */
+
+		if(bridge_channel->features->ast_write_block ==0)
+		      ast_write(bridge_channel->chan, fr);
+		/*~ AICS  */
 		break;
 	}
 	bridge_frame_free(fr);
@@ -2385,6 +2443,7 @@ static void bridge_channel_wait(struct ast_bridge_channel *bridge_channel)
 	int ms;
 	int outfd;
 	struct ast_channel *chan;
+	struct timeval* tt=ast_channel_whentohangup(bridge_channel->chan);
 
 	/* Wait for data to either come from the channel or us to be signaled */
 	ast_bridge_channel_lock(bridge_channel);
@@ -2401,6 +2460,8 @@ static void bridge_channel_wait(struct ast_bridge_channel *bridge_channel)
 		ms = bridge_channel_next_timeout(bridge_channel);
 		chan = ast_waitfor_nandfds(&bridge_channel->chan, 1,
 			&bridge_channel->alert_pipe[0], 1, NULL, &outfd, &ms);
+//ast_verb( 2, "_wait() %s[%d,%d,%ld,%p,%p,%d ]\n", ast_channel_name(bridge_channel->chan),ms,outfd,tt->tv_sec,&bridge_channel->alert_pipe[0],chan,bridge_channel->features->ast_write_block);
+
 		if (ast_channel_unbridged(bridge_channel->chan)) {
 			ast_channel_set_unbridged(bridge_channel->chan, 0);
 			ast_bridge_channel_lock_bridge(bridge_channel);
@@ -2414,7 +2475,9 @@ static void bridge_channel_wait(struct ast_bridge_channel *bridge_channel)
 		if (!bridge_channel->suspended
 			&& bridge_channel->state == BRIDGE_CHANNEL_STATE_WAIT) {
 			if (chan) {
+
 				bridge_handle_trip(bridge_channel);
+
 			} else if (ms == 0) {
 				/* An interdigit timeout or interval expired. */
 				bridge_channel_handle_feature_timeout(bridge_channel);
@@ -2425,6 +2488,7 @@ static void bridge_channel_wait(struct ast_bridge_channel *bridge_channel)
 				 * an infinite loop due to deferring write queue
 				 * actions while trying to match DTMF feature hooks.
 				 */
+//				ast_log(LOG_NOTICE, "2_trip() %s\n,", ast_channel_name(bridge_channel->chan));
 				bridge_channel_handle_write(bridge_channel);
 			}
 		}

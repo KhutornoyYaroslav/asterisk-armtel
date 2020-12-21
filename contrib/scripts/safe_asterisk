@@ -6,7 +6,11 @@ ASTVARRUNDIR="__ASTERISK_VARRUN_DIR__"
 ASTVARLOGDIR="__ASTERISK_LOG_DIR__"
 
 CLIARGS="$*"			# Grab any args passed to safe_asterisk
-TTY=9				# TTY (if you want one) for Asterisk to run on
+#WARNING! with TTY=1 safe_asterisk not start on boot in virtual machine esxi
+#with TTY=3 safe_asterisk has not start problem on that machie.
+#disable logging to TTY to prevent problems!
+#TTY=1				# TTY (if you want one) for Asterisk to run on
+
 CONSOLE=yes			# Whether or not you want a console
 #NOTIFY=root@localhost		# Who to notify about crashes
 #EXEC=/path/to/somescript	# Run this command if Asterisk crashes

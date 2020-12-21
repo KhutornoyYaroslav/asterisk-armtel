@@ -28,6 +28,7 @@
  ***/
 
 #include "asterisk.h"
+#include "aics.h"
 
 ASTERISK_FILE_VERSION(__FILE__, "$Revision: 416211 $")
 
@@ -269,6 +270,99 @@ int ast_dial_append(struct ast_dial *dial, const char *tech, const char *device,
 	return channel->num;
 }
 
+/*! \brief AICS Helper function that requests all channels */
+static int aics_begin_dial_prerun(struct ast_dial_channel *channel, struct ast_channel *chan, struct ast_format_cap *cap)
+{
+	char numsubst[AST_MAX_EXTENSION];
+	struct ast_format_cap *cap_all_audio = NULL;
+	struct ast_format_cap *cap_request;
+	struct ast_assigned_ids assignedids = {
+		.uniqueid = channel->assignedid1,
+		.uniqueid2 = channel->assignedid2,
+	};
+
+	/* Copy device string over */
+	ast_copy_string(numsubst, channel->device, sizeof(numsubst));
+
+	if (!ast_format_cap_is_empty(cap)) {
+		cap_request = cap;
+	} else if (chan) {
+		cap_request = ast_channel_nativeformats(chan);
+	} else {
+		cap_all_audio = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_NOLOCK);
+		ast_format_cap_add_all_by_type(cap_all_audio, AST_FORMAT_TYPE_AUDIO);
+		cap_request = cap_all_audio;
+	}
+
+	/* If we fail to create our owner channel bail out */
+	if (!(channel->owner = ast_request(channel->tech, cap_request, &assignedids, chan, numsubst, &channel->cause))) {
+		cap_all_audio = ast_format_cap_destroy(cap_all_audio);
+		return -1;
+	}
+	cap_request = NULL;
+	cap_all_audio = ast_format_cap_destroy(cap_all_audio);
+
+	ast_channel_lock(channel->owner);
+	ast_channel_stage_snapshot(channel->owner);
+
+	ast_channel_appl_set(channel->owner, "AppDial2");
+	ast_channel_data_set(channel->owner, "(Outgoing Line)");
+
+	memset(ast_channel_whentohangup(channel->owner), 0, sizeof(*ast_channel_whentohangup(channel->owner)));
+ast_log(LOG_NOTICE, "inheritance [%p] %s/%s [%p] %s/%s!\n", channel->owner, ast_channel_exten(channel->owner), ast_channel_name(channel->owner), chan, ast_channel_exten(chan), ast_channel_name(chan));
+	/* Inherit everything from he who spawned this dial */
+	if (chan) {
+
+		//ast_channel_ggs_scenario_set(channel->owner, ast_channel_ggs_scenario(chan));
+//		struct aics_channel_addons* srcaddons = ast_channel_addons(chan);
+//		struct aics_channel_addons* dstaddons = ast_channel_addons(channel->owner);
+//		dstaddons->scenario = srcaddons->scenario;
+
+		aics_proxy_params_copy(ast_channel_proxy(channel->owner), ast_channel_proxy(chan));
+
+		ast_channel_inherit_variables(chan, channel->owner);
+		ast_channel_datastore_inherit(chan, channel->owner);
+
+		/* Copy over callerid information */
+		ast_party_redirecting_copy(ast_channel_redirecting(channel->owner), ast_channel_redirecting(chan));
+
+		ast_channel_dialed(channel->owner)->transit_network_select = ast_channel_dialed(chan)->transit_network_select;
+
+		ast_connected_line_copy_from_caller(ast_channel_connected(channel->owner), ast_channel_caller(chan));
+
+		ast_channel_language_set(channel->owner, ast_channel_language(chan));
+		ast_channel_accountcode_set(channel->owner, ast_channel_accountcode(chan));
+		if (ast_strlen_zero(ast_channel_musicclass(channel->owner)))
+			ast_channel_musicclass_set(channel->owner, ast_channel_musicclass(chan));
+
+		ast_channel_adsicpe_set(channel->owner, ast_channel_adsicpe(chan));
+		ast_channel_transfercapability_set(channel->owner, ast_channel_transfercapability(chan));
+
+
+	}
+
+	ast_channel_stage_snapshot_done(channel->owner);
+	ast_channel_unlock(channel->owner);
+
+	return 0;
+}
+
+int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast_format_cap *cap)
+{
+	struct ast_dial_channel *channel;
+	int res = -1;
+
+	AST_LIST_LOCK(&dial->channels);
+	AST_LIST_TRAVERSE(&dial->channels, channel, list) {
+		if ((res = aics_begin_dial_prerun(channel, chan, cap))) {
+			break;
+		}
+	}
+	AST_LIST_UNLOCK(&dial->channels);
+
+	return res;
+}
+
 /*! \brief Helper function that requests all channels */
 static int begin_dial_prerun(struct ast_dial_channel *channel, struct ast_channel *chan, struct ast_format_cap *cap)
 {
@@ -308,7 +402,7 @@ static int begin_dial_prerun(struct ast_dial_channel *channel, struct ast_channe
 	ast_channel_data_set(channel->owner, "(Outgoing Line)");
 
 	memset(ast_channel_whentohangup(channel->owner), 0, sizeof(*ast_channel_whentohangup(channel->owner)));
-
+ast_log(LOG_NOTICE, "inheritance [%p] [%p]!!!\n", channel, chan);
 	/* Inherit everything from he who spawned this dial */
 	if (chan) {
 		ast_channel_inherit_variables(chan, channel->owner);
@@ -365,7 +459,7 @@ static int begin_dial_channel(struct ast_dial_channel *channel, struct ast_chann
 
 	/* Copy device string over */
 	ast_copy_string(numsubst, channel->device, sizeof(numsubst));
-
+//ast_log(LOG_NOTICE, "ready to call\n");
 	/* Attempt to actually call this device */
 	if ((res = ast_call(channel->owner, numsubst, 0))) {
 		res = 0;
@@ -757,6 +851,10 @@ static enum ast_dial_result monitor_dial(struct ast_dial *dial, struct ast_chann
 			timeout = handle_timeout_trip(dial, start);
 			continue;
 		}
+
+//		const char * ch = (chan? ast_channel_callpriority(chan): NULL);
+//    	const char * wh = (who ? ast_channel_callpriority(who) : NULL);
+//		ast_log(LOG_NOTICE, "ch '%s' p %p wh '%s' p %p\n",ch,chan,wh,who);
 
 		/* Find relative dial channel */
 		if (!chan || !IS_CALLER(chan, who))

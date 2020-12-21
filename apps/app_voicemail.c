@@ -144,6 +144,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 428864 $")
 #include "asterisk/threadstorage.h"
 #endif
 
+#include "asterisk/dial.h"
 /*** DOCUMENTATION
 	<application name="VoiceMail" language="en_US">
 		<synopsis>
@@ -942,6 +943,11 @@ static char *app4 = "VMAuthenticate";
 static char *playmsg_app = "VoiceMailPlayMsg";
 
 static char *sayname_app = "VMSayName";
+
+#define ARMTEL_QUEUE 
+#ifdef ARMTEL_QUEUE
+ static char *queue_app = "PlayVoiceMail";
+#endif
 
 static AST_LIST_HEAD_STATIC(users, ast_vm_user);
 static AST_LIST_HEAD_STATIC(zones, vm_zone);
@@ -11619,6 +11625,169 @@ out:
 #endif
 	return res;
 }
+#ifdef ARMTEL_QUEUE
+
+static void dial_state_callback(struct ast_dial *dial)
+{
+	struct ast_channel *chan;
+	struct page_options *options;
+// ast_log(LOG_ERROR, "First my app callback[%d]\n",ast_dial_state(dial));
+//if((chan = ast_dial_answered(dial))!=NULL)  ast_log(LOG_ERROR, "First my app callback[%s][%d]\n",ast_channel_name(chan),ast_dial_state(dial));
+	if (ast_dial_state(dial) != AST_DIAL_RESULT_ANSWERED ||
+	    !(chan = ast_dial_answered(dial)) ||
+	    !(options = ast_dial_get_user_data(dial))) {
+		return;
+	}
+}
+
+//-----------------------------------------------------------------------
+//приложение проигрывает содержимое почтового ящика и очищает
+//адрес почтового ящика и на кого пригрывать передаются через параметры
+//------------------------------------------------------------------------
+static int vm_playbox_exec(struct ast_channel *chan, const char *data)
+{
+	char *parse;
+	char *mailbox = NULL;
+	char *context = NULL;
+//	int res;
+
+	AST_DECLARE_APP_ARGS(args,
+		AST_APP_ARG(mailbox);
+		AST_APP_ARG(msg_id);
+	);
+
+	if (ast_channel_state(chan) != AST_STATE_UP) {
+		ast_debug(1, "Before ast_answer\n");
+		ast_answer(chan);
+	}
+
+	if (ast_strlen_zero(data)) {
+		return -1;
+	}
+
+	parse = ast_strdupa(data);
+	AST_STANDARD_APP_ARGS(args, parse);
+
+	if (ast_strlen_zero(args.mailbox) || ast_strlen_zero(args.msg_id)) {
+		return -1;
+	}
+
+	if ((context = strchr(args.mailbox, '@'))) {
+		*context++ = '\0';
+	}
+	mailbox = args.mailbox;
+	ast_log(LOG_NOTICE, "Play mail box:%s;context=%s;chan=%s[state=%d]]  \n",mailbox,context,args.msg_id,ast_channel_state(chan));		
+
+	struct vm_state vms;
+	struct ast_vm_user *vmu = NULL, vmus;
+	int res = 0;
+	int open = 0;
+	int played = 0;
+	int i;
+    struct ast_app *app,*app1;
+
+	memset(&vmus, 0, sizeof(vmus));
+	memset(&vms, 0, sizeof(vms));
+
+	if (!(vmu = find_user(&vmus, context, mailbox))) {
+		goto play_msg_cleanup;
+	}
+
+	/* Iterate through every folder, find the msg, and play it */
+//	for (i = 0; i < ARRAY_LEN(mailbox_folders) && !played; i++) {
+		ast_copy_string(vms.username, mailbox, sizeof(vms.username));
+		vms.lastmsg = -1;
+
+		/* open the mailbox state */
+		if ((res = open_mailbox(&vms, vmu, NEW_FOLDER)) < 0) {
+			ast_log(LOG_WARNING, "Could not open mailbox %s\n", mailbox);
+			res = -1;
+			goto play_msg_cleanup;
+		}
+		open = 1;
+//	ast_log(LOG_NOTICE, "Message count=%d  \n",vms.lastmsg);		
+	    if (!(app1 = pbx_findapp("Hangup"))) {
+		    ast_log(LOG_WARNING, "There is no Hangup application available!\n");
+			goto play_msg_cleanup;
+	    };
+	    if (!(app = pbx_findapp("SimplePlayback"))) {
+		   ast_log(LOG_WARNING, "There is no SimplePlayback application available!\n");
+		   goto play_msg_cleanup;
+	    }
+
+        char file[1024]={0};
+		for (vms.curmsg = 0; vms.curmsg <= vms.lastmsg; vms.curmsg++) {
+
+		   make_file(vms.fn, sizeof(vms.fn), vms.curdir, vms.curmsg);
+		   if(vms.curmsg == 0) strcat(file,vms.fn);
+		   else{
+			   if( (strlen(file)+strlen(vms.fn)+1) < 1024){
+			     strcat(file,"&");
+			     strcat(file,vms.fn);
+			   }
+		   }
+		}
+	    if(strlen(file)==0){
+              ast_log(LOG_NOTICE, "Mailbox not message \n");
+		      goto play_msg_cleanup;
+		}
+
+		char playmes[1024]={0};
+        snprintf(playmes, sizeof(playmes), "SimplePlayback,%s,%s,%s", file,"1","queue");
+        ast_log(LOG_NOTICE, "Playmes=%s  \n",playmes);
+ 
+        char *tech, *resource;
+		tech = strsep(&args.msg_id, "&");
+		if (!(resource = strchr(tech, '/'))) {
+			ast_log(LOG_WARNING, "Incomplete destination '%s' supplied.\n", tech);
+		    goto play_msg_cleanup;
+		}
+		*resource++ = '\0';
+		struct ast_dial *dial = NULL;
+		/* Create a dialing structure */
+		if (!(dial = ast_dial_create())) {
+			ast_log(LOG_WARNING, "Failed to create dialing structure.\n");
+			goto play_msg_cleanup;
+		}
+		/* Append technology and resource */
+		ast_log(LOG_NOTICE, "ast_dial_append  tech=%s;resource=%s  \n",tech,resource);
+		if (ast_dial_append(dial, tech, resource, NULL) == -1) {
+			ast_log(LOG_ERROR, "Failed to add %s to outbound dial\n", tech);
+			ast_dial_destroy(dial);
+			goto play_msg_cleanup;
+		}
+		ast_dial_option_global_enable(dial, AST_DIAL_OPTION_ANSWER_EXEC, playmes);
+		ast_dial_set_state_callback(dial, &dial_state_callback);
+		/* Run this dial in async mode */
+		ast_dial_run(dial, chan, 1);
+        played=1;
+		/* close mailbox */
+		if ((res = close_mailbox(&vms, vmu) == ERROR_LOCK_PATH)) {
+			res = -1;
+			goto play_msg_cleanup;
+		}
+		open = 0;
+		pbx_exec(chan, app1, NULL);
+	    return -1;
+play_msg_cleanup:
+	if (!played) {
+		res = -1;
+	}
+/*
+	if (vmu && open) {
+		close_mailbox(&vms, vmu);
+	}
+
+#ifdef IMAP_STORAGE
+	if (vmu) {
+		vmstate_delete(&vms);
+	}
+#endif
+*/
+return 0;
+}
+#endif
+
 
 static int vm_exec(struct ast_channel *chan, const char *data)
 {
@@ -14336,6 +14505,9 @@ static int unload_module(void)
 	res |= ast_unregister_application(app4);
 	res |= ast_unregister_application(playmsg_app);
 	res |= ast_unregister_application(sayname_app);
+#ifdef ARMTEL_QUEUE
+	res |= ast_unregister_application(queue_app);
+#endif
 	res |= ast_custom_function_unregister(&mailbox_exists_acf);
 	res |= ast_custom_function_unregister(&vm_info_acf);
 	res |= ast_manager_unregister("VoicemailUsersList");
@@ -14404,6 +14576,10 @@ static int load_module(void)
 	res |= ast_register_application_xml(app4, vmauthenticate);
 	res |= ast_register_application_xml(playmsg_app, vm_playmsgexec);
 	res |= ast_register_application_xml(sayname_app, vmsayname_exec);
+#ifdef ARMTEL_QUEUE
+	res |= ast_register_application_xml(queue_app, vm_playbox_exec);
+#endif
+
 	res |= ast_custom_function_register(&mailbox_exists_acf);
 	res |= ast_custom_function_register(&vm_info_acf);
 	res |= ast_manager_register_xml("VoicemailUsersList", EVENT_FLAG_CALL | EVENT_FLAG_REPORTING, manager_list_voicemail_users);

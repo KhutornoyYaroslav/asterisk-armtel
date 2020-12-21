@@ -30,6 +30,11 @@
 #include "asterisk/ccss.h"
 #include <libpri.h>
 #include <dahdi/user.h>
+#include "aics.h"
+
+
+#define RAST_LOG
+
 
 #if defined(HAVE_PRI_CCSS)
 /*! PRI debug message flags when normal PRI debugging is turned on at the command line. */
@@ -67,7 +72,13 @@ enum sig_pri_tone {
 enum sig_pri_law {
 	SIG_PRI_DEFLAW = 0,
 	SIG_PRI_ULAW,
+#ifdef PRI_ARMTEL_EXT1
+	SIG_PRI_ALAW,
+	SIG_PRI_ALAWDCN
+#else
 	SIG_PRI_ALAW
+
+#endif
 };
 
 enum sig_pri_moh_signaling {
@@ -226,6 +237,11 @@ struct sig_pri_callback {
 	 * \return Nothing
 	 */
 	void (* const ami_channel_event)(void *pvt, struct ast_channel *chan);
+#ifdef  PRI_ARMTEL_EXT
+
+	void (* const armtel_channel_event)(char* num,int state);
+
+#endif
 
 	/*! Reference the parent module. */
 	void (*module_ref)(void);
@@ -725,5 +741,35 @@ void sig_pri_cc_monitor_destructor(void *monitor_pvt);
 
 int sig_pri_load(const char *cc_type_name);
 void sig_pri_unload(void);
+#ifdef PRI_ARMTEL_EXT
+
+
+enum armtel_context {
+	ARMTEL_CONTEXT_DUPLEX,
+	ARMTEL_CONTEXT_SIMPLEX,
+	ARMTEL_CONTEXT_TONE_DUPLEX,
+	ARMTEL_CONTEXT_CYRCULAR,
+	ARMTEL_CONTEXT_CELECTOR,
+	ARMTEL_CONTEXT_CONF,
+	ARMTEL_CONTEXT_ONLY_SIMPLEX,
+	ARMTEL_CONTEXT_LISTEN,
+	ARMTEL_CONTEXT_TALK_BACK,
+};
+
+
+#define ARMTEL_FILE_CONFIG "armtel.conf"
+int armtel_load(const char *name,int reload);
+void armtel_show(void);
+void armtel_reload(void);
+void armtel_debug(int state);
+int armtel_get_debug(void);
+int armtel_get_bandwidth(void);
+unsigned char armtel_context_from_aisc(enum aics_direction dir,enum aics_scenario sce);
+enum aics_direction armtel_context_to_aisc(unsigned char context,enum aics_scenario *sce);
+int armtel_get_hint(char* hint,char* num);
+
+//void str_to_hex(char* hex ,char* str,int len=0 );
+
+#endif
 
 #endif /* _SIG_PRI_H */

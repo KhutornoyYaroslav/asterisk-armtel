@@ -23,7 +23,7 @@
 #define _SIP_H
 
 #include "asterisk.h"
-
+#include "aics.h"
 #include "asterisk/stringfields.h"
 #include "asterisk/linkedlists.h"
 #include "asterisk/strings.h"
@@ -38,6 +38,8 @@
 #include "asterisk/rtp_engine.h"
 #include "asterisk/netsock2.h"
 #include "asterisk/features_config.h"
+
+ #define SIP_ARMTEL_QUEUE
 
 #ifndef FALSE
 #define FALSE    0
@@ -469,6 +471,7 @@ enum subscriptiontype {
 	PIDF_XML,
 	MWI_NOTIFICATION,
 	CALL_COMPLETION,
+	AIDF_XML,
 };
 
 /*! \brief The number of media types in enum \ref media_type below. */
@@ -1044,12 +1047,17 @@ struct sip_pvt {
 		AST_STRING_FIELD(our_contact);  /*!< Our contact header */
 		AST_STRING_FIELD(url);          /*!< URL to be sent with next message to peer */
 		AST_STRING_FIELD(parkinglot);   /*!< Parkinglot */
+//		AST_STRING_FIELD(callpriority); /* AICS support for SIP 'Priority:' header */
+//		AST_STRING_FIELD(ipn20_sdp_a);	/* AICS support for SDP 'a=sendonly' atribute */
 		AST_STRING_FIELD(engine);       /*!< RTP engine to use */
 		AST_STRING_FIELD(dialstring);   /*!< The dialstring used to call this SIP endpoint */
 		AST_STRING_FIELD(last_presence_subtype);   /*!< The last presence subtype sent for a subscription. */
 		AST_STRING_FIELD(last_presence_message);   /*!< The last presence message for a subscription */
 		AST_STRING_FIELD(msg_body);     /*!< Text for a MESSAGE body */
 	);
+
+	struct aics_proxy_params aics_proxy;		/* AICS proxy */
+	struct aics_local_params aics_local;		/* AICS local */
 	char via[128];                          /*!< Via: header */
 	int maxforwards;                        /*!< SIP Loop prevention */
 	struct sip_socket socket;               /*!< The socket used for this dialog */
@@ -1081,6 +1089,7 @@ struct sip_pvt {
 	                                       */
 	unsigned short req_secure_signaling:1;/*!< Whether we are required to have secure signaling or not */
 	unsigned short natdetected:1;         /*!< Whether we detected a NAT when processing the Via */
+	unsigned int spy:1;				/* AICS call registration */
 	int timer_t1;                     /*!< SIP timer T1, ms rtt */
 	int timer_b;                      /*!< SIP timer B, ms */
 	unsigned int sipoptions;          /*!< Supported SIP options on the other end */
@@ -1250,6 +1259,32 @@ struct sip_mailbox {
 	char id[1];
 };
 
+
+///* AICS list to store armtel event subscribers/subscriptions for peer */
+//struct sip_armtel_subs {
+//	char name[80]; // subscriber/subscription name
+//	char callid[255]; // dialog callid
+//	AST_LIST_ENTRY(sip_armtel_subs) nextsub;
+//};
+///* AICS Who am i? subscriber or notifier? */
+//enum armtelsubtype {
+//	AE_UNSET = 0,
+//	AE_SUBSCRIBER,
+//	AE_NOTIFIER,
+//	AE_LAST
+//};
+//static const char * const armtelsubtypestr[AE_LAST] = {
+//	[AE_UNSET]    	   		= "unset",
+//	[AE_SUBSCRIBER]    	   	= "subscriber",
+//	[AE_NOTIFIER]  			= "notifier",
+//};
+///* AICS armtel event subscription keeper struct */
+//struct sip_armtel_event {
+//	enum armtelsubtype armtel_type; /* AICS subscription type */
+//	AST_LIST_HEAD_NOLOCK(, sip_armtel_subs) armtel_subs;  /* AICS Subscriptions/subscribers for armtel event */
+//	struct ast_str *armtel_body; /* AICS body for armtel event */
+//};
+
 /*! \brief Structure for SIP peer data, we place calls to peers if registered  or fixed IP address (host)
 */
 /* XXX field 'name' must be first otherwise sip_addrcmp() will fail, as will astobj2 hashing of the structure */
@@ -1278,6 +1313,9 @@ struct sip_peer {
 		AST_STRING_FIELD(mohinterpret); /*!<  Music on Hold class */
 		AST_STRING_FIELD(mohsuggest);   /*!<  Music on Hold class */
 		AST_STRING_FIELD(parkinglot);   /*!<  Parkinglot */
+		AST_STRING_FIELD(callpriority); /* AICS support for callpriority field */
+		AST_STRING_FIELD(priorityhandle); /* AICS support for priorityhandle field */
+		AST_STRING_FIELD(hangupanounce); /* AICS support for hangupanounce field */
 		AST_STRING_FIELD(useragent);    /*!<  User agent in SIP request (saved from registration) */
 		AST_STRING_FIELD(mwi_from);     /*!< Name to place in From header for outgoing NOTIFY requests */
 		AST_STRING_FIELD(engine);       /*!<  RTP Engine to use */
@@ -1286,6 +1324,9 @@ struct sip_peer {
 		AST_STRING_FIELD(record_on_feature); /*!< Feature to use when receiving INFO with record: on during a call */
 		AST_STRING_FIELD(record_off_feature); /*!< Feature to use when receiving INFO with record: off during a call */
 		AST_STRING_FIELD(callback); /*!< Callback extension */
+ #ifdef SIP_ARMTEL_QUEUE
+		AST_STRING_FIELD(armtel_queue); /*!< Armtel_queue */
+ #endif
 		);
 	struct sip_socket socket;       /*!< Socket used for this peer */
 	enum ast_transport default_outbound_transport;   /*!< Peer Registration may change the default outbound transport.
@@ -1302,6 +1343,7 @@ struct sip_peer {
 	                                 *   for incoming calls
 	                                 */
 	unsigned short deprecated_username:1; /*!< If it's a realtime peer, are they using the deprecated "username" instead of "defaultuser" */
+	unsigned int spy:1;				/* AICS call registration */
 	struct sip_auth_container *auth;/*!< Realm authentication credentials */
 	int amaflags;                   /*!< AMA Flags (for billing) */
 	int callingpres;                /*!< Calling id presentation */
@@ -1349,6 +1391,7 @@ struct sip_peer {
 	struct ast_acl_list *directmediaacl;   /*!<  Restrict what IPs are allowed to interchange direct media with */
 	struct ast_variable *chanvars;  /*!<  Variables to set for channel created by user */
 	struct sip_pvt *mwipvt;         /*!<  Subscription for MWI */
+
 	struct sip_st_cfg stimer;       /*!<  SIP Session-Timers */
 	int timer_t1;                   /*!<  The maximum T1 value for the peer */
 	int timer_b;                    /*!<  The maximum timer B (transaction timeouts) */
@@ -1363,6 +1406,8 @@ struct sip_peer {
 	struct ast_endpoint *endpoint;
 
 	struct ast_rtp_dtls_cfg dtls_cfg;
+
+	//struct sip_armtel_event armtel_event;
 };
 
 /*!

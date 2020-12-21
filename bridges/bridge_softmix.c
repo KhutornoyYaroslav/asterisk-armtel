@@ -54,6 +54,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 413588 $")
 #include "asterisk/astobj2.h"
 #include "asterisk/timing.h"
 #include "asterisk/translate.h"
+#include "aics.h"
 
 #define MAX_DATALEN 8096
 
@@ -173,6 +174,17 @@ struct softmix_translate_helper {
 	struct ast_format slin_src; /*!< the source format expected for all the translators */
 	AST_LIST_HEAD_NOLOCK(, softmix_translate_helper_entry) entries;
 };
+
+
+/* AICS addons support */
+void check_member_join(struct ast_bridge *bridge, struct ast_bridge_channel *bch);
+void check_member_leave(struct ast_bridge *bridge, struct ast_bridge_channel *bch);
+void armtel_set_audio(struct ast_bridge *bridge,struct ast_bridge_channel *init);
+void armtel_set_audio_sirc_memb(struct ast_bridge *bridge,struct ast_bridge_channel *init,struct ast_bridge_channel *memb);
+void armtel_show_audio(struct ast_bridge *bridge);
+
+/* AICS addons support */
+
 
 static struct softmix_translate_helper_entry *softmix_translate_helper_entry_alloc(struct ast_format *dst)
 {
@@ -409,6 +421,9 @@ static int softmix_bridge_join(struct ast_bridge *bridge, struct ast_bridge_chan
 	if (!(sc = ast_calloc(1, sizeof(*sc)))) {
 		return -1;
 	}
+/* AICS addons support */
+    check_member_join(bridge,bridge_channel);
+/* AICS addons support */
 
 	softmix_src_change(bridge_channel);
 
@@ -436,6 +451,9 @@ static void softmix_bridge_leave(struct ast_bridge *bridge, struct ast_bridge_ch
 	if (!sc) {
 		return;
 	}
+/* AICS addons support */
+    check_member_leave(bridge,bridge_channel);
+/* AICS addons support */
 	bridge_channel->tech_pvt = NULL;
 
 	softmix_src_change(bridge_channel);
@@ -588,6 +606,94 @@ static void softmix_bridge_write_voice(struct ast_bridge *bridge, struct ast_bri
 	}
 }
 
+void check_member_join(struct ast_bridge *bridge, struct ast_bridge_channel *bch)
+{
+struct aics_proxy_params *abc = ast_channel_proxy(bch->chan);
+ if ((abc->is_member ==0)&&((abc->scenario == AICS_SCENARIO_SELECTOR)||(abc->scenario == AICS_SCENARIO_CIRCULAR)||(abc->scenario == AICS_SCENARIO_GROUP)))
+ {
+  bch->features->ast_write_block=1;
+ //   ast_log(LOG_WARNING, "%s#mute=%d,write=%d\n",ast_channel_name(bch->chan),bch->features->mute,bch->features->ast_write_block);
+
+ }
+}
+
+void check_member_leave(struct ast_bridge *bridge, struct ast_bridge_channel *bch)
+{
+struct aics_sig_armtel out;
+struct aics_proxy_params *abc = ast_channel_proxy(bch->chan);
+ if ((abc->is_member !=0) && (bch->features->mute == 0))
+ {
+          aics_num_from_name(out.number,ast_channel_name(bch->chan));
+	    struct ast_bridge_channel *bc;
+	    AST_LIST_TRAVERSE(&bridge->channels, bc, entry) {
+		   struct aics_proxy_params *aipm = ast_channel_proxy(bc->chan);
+	        if((aipm !=NULL)&&(aipm->is_member==0)) {
+               out.cmd=AICS_ARMTEL_REMOVE_WORD;
+	           out.context=1;
+		       out.prio=100;
+               ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+              if(aipm->scenario==AICS_SCENARIO_SELECTOR){
+ 	   	  //   	ast_bridge_channel_lock(bc);
+ 	           //включаем микрофон на инициаторе выключаем на участнике
+ 	   	  //       armtel_set_mute(bridge,bc);
+ 	   	  //   	ast_bridge_channel_unlock(bc);
+ 	   	     	armtel_set_audio(bridge,bc);
+			  }
+ 	     	  else if(aipm->scenario==AICS_SCENARIO_CIRCULAR){
+// 	          	ast_bridge_channel_lock(bc);
+// 	            //включаем микрофон на инициаторе выключаем на участнике
+ 	   	     	armtel_set_audio(bridge,bc);
+// 	   	         armtel_set_mute(bridge,bc);
+ 	    	     //включаем аудио выход всем участником
+// 	    	 	armtel_unblock_audio_out (bridge);
+//				ast_bridge_channel_unlock(bc);
+   		      }
+			  aipm->prio_member=-1;
+   	   		}
+        }
+  }
+}
+void armtel_set_audio(struct ast_bridge *bridge,struct ast_bridge_channel *init)
+{
+	struct ast_bridge_channel *bc;
+	AST_LIST_TRAVERSE(&bridge->channels, bc, entry) {
+        ast_bridge_channel_lock(bc);
+		bc->features->mute=1;
+		bc->features->ast_write_block=0;
+		ast_bridge_channel_unlock(bc);
+	}
+    ast_bridge_channel_lock(init);
+	init->features->mute=0;
+	init->features->ast_write_block=1;
+    ast_bridge_channel_unlock(init);
+
+}
+void armtel_set_audio_sirc_memb(struct ast_bridge *bridge,struct ast_bridge_channel *init,struct ast_bridge_channel *memb)
+{
+	struct ast_bridge_channel *bc;
+	AST_LIST_TRAVERSE(&bridge->channels, bc, entry) {
+        ast_bridge_channel_lock(bc);
+		bc->features->mute=1;
+		bc->features->ast_write_block=1;
+		ast_bridge_channel_unlock(bc);
+	}
+    ast_bridge_channel_lock(memb);
+	memb->features->mute=0;
+    ast_bridge_channel_unlock(memb);
+    ast_bridge_channel_lock(init);
+    init->features->ast_write_block=0;
+    ast_bridge_channel_unlock(init);
+}
+
+void armtel_show_audio(struct ast_bridge *bridge)
+{
+	struct ast_bridge_channel *bc;
+	AST_LIST_TRAVERSE(&bridge->channels, bc, entry) {
+	    ast_log(LOG_WARNING, "%s#mute=%d,write=%d\n",ast_channel_name(bc->chan),bc->features->mute,bc->features->ast_write_block);
+	}
+}
+
+
 /*!
  * \internal
  * \brief Determine what to do with a control frame.
@@ -606,8 +712,120 @@ static int softmix_bridge_write_control(struct ast_bridge *bridge, struct ast_br
 	 * XXX Softmix needs to use channel roles to determine what to
 	 * do with control frames.
 	 */
+	struct ast_bridge_channel *bc;
+	struct aics_sig_armtel out;
+	if(frame->subclass.integer == AST_CONTROL_ARMTEL_SIG){
+//		  ast_log(LOG_WARNING, "sig ARMTEL !!!!!!!!!!;\n");
+		 struct aics_proxy_params *abc = ast_channel_proxy(bridge_channel->chan);
+		    if(abc ==NULL) return 0;
+            aics_num_from_name(out.number,ast_channel_name(bridge_channel->chan));
+			AST_LIST_TRAVERSE(&bridge->channels, bc, entry) {
+					 struct aics_proxy_params *aipm = ast_channel_proxy(bc->chan);
+					 if(aipm !=NULL){
+//			     ast_log(LOG_WARNING, "sig ARMTEL(%s)is_member=%d;prio_member=%d[%d];state_member=%d;features->mute=%d \n",ast_channel_name(bc->chan),aipm->is_member,aipm->prio_member,abc->sig_armtel.prio,aipm->state_member, bc->features->mute);
+                         if(aipm->is_member==0){
+     						   if(abc->sig_armtel.cmd==AICS_ARMTEL_ASK_WORD){//<------
+     							  if(aipm->prio_member< abc->sig_armtel.prio){
+     							    abc->state_member=AICS_STATE_ASK_WORD;// на участнике
+     							  //запрос участника инициатору
+         						    out.cmd=abc->sig_armtel.cmd;
+         						    out.context=abc->sig_armtel.context;
+         						    out.prio=abc->sig_armtel.prio;
+                                    ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+     							    aipm->prio_member=abc->sig_armtel.prio;
+     							  }
+     							  else{
+     							    abc->state_member=AICS_STATE_IDLE;// на участнике
+                                    // инициатор занят более высоким приоритетом ответ участнику
+         						    out.cmd=AICS_ARMTEL_DIRECTION;
+         						    out.context=AICS_CONTEXT_ARMTEL_ACT_BUSY;
+           						    ast_indicate_data(bridge_channel->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+     							  }
+     						   }
+     						   else if(abc->sig_armtel.cmd==AICS_ARMTEL_REMOVE_WORD){//<----
+     							   //запрос участника инициатору
+         						   out.cmd=abc->sig_armtel.cmd;
+        						   out.context=abc->sig_armtel.context;
+        						   out.prio=abc->sig_armtel.prio;
+                                   ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+     						   }
+					     }
+                         if(aipm->state_member==AICS_STATE_ASK_WORD){
+   						   if(abc->sig_armtel.cmd==AICS_ARMTEL_DIRECTION){//---->
+   	   						   if(abc->sig_armtel.context==AICS_CONTEXT_ARMTEL_ACT_SPEAK){
+   	   							 if(aipm->scenario==AICS_SCENARIO_SELECTOR){
+                                   //включаем микрофон на участнике выключаем на инициаторе
+ 	   							    armtel_set_audio(bridge,bc);
+   	   						     }
+   	   							 else if(aipm->scenario==AICS_SCENARIO_CIRCULAR){
+                                      //включаем микрофон на участнике выключаем на инициаторе
+   	   							    armtel_set_audio_sirc_memb(bridge,bridge_channel,bc);
+   	   							 }
+                                 //передаем участнику ответ инициатора
+                        //         armtel_show_audio(bridge);
+ 	     						 out.cmd=abc->sig_armtel.cmd;
+      						     out.context=abc->sig_armtel.context;
+      						     out.prio=abc->sig_armtel.prio;
+ 	     						 ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+   						       }
+	   						   aipm->state_member=AICS_STATE_ACTIV;
+                               continue;
+   						   }
+                         }                         }
+                         if(aipm->state_member==AICS_STATE_ACTIV){
+     					   if(abc->sig_armtel.cmd==AICS_ARMTEL_DIRECTION){
+   	   						   if(abc->sig_armtel.context==AICS_CONTEXT_ARMTEL_ACT_LISTEN){
+   	   							 aipm->state_member=AICS_STATE_IDLE;
+   	   							 abc->prio_member=-1;
+   	   							 if(aipm->scenario==AICS_SCENARIO_SELECTOR){
+                                     //включаем микрофон на инициаторе выключаем на участнике
+ 	   							       armtel_set_audio(bridge,bridge_channel);
+     	   						 }
+     	   						 else if(aipm->scenario==AICS_SCENARIO_CIRCULAR){
+                                     //включаем микрофон на инициаторе выключаем на участнике
+   	   							       armtel_set_audio(bridge,bridge_channel);
+     	   						 }
+                                   //передаем участнику ответ инициатора
+                         //        armtel_show_audio(bridge);
+ 	     						 out.cmd=abc->sig_armtel.cmd;
+      						     out.context=abc->sig_armtel.context;
+      						     out.prio=abc->sig_armtel.prio;
+   	                             ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+   	   						   }
+   	   						   else if(abc->sig_armtel.context==AICS_CONTEXT_ARMTEL_ACT_SPEAK){
+
+     	   							aipm->state_member=AICS_STATE_IDLE;
+                                   // этот канал вытеснен более приоритетным
+   	     						   out.cmd=AICS_ARMTEL_DIRECTION;
+        						   out.context=AICS_CONTEXT_ARMTEL_ACT_LISTEN_BTN_OFF;
+                                   ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+   	   						   }
+	   						   else if(abc->sig_armtel.context==AICS_CONTEXT_ARMTEL_ACT_LISTEN_BTN_OFF){
+ 	   							   // возврат слова инициатором при ответе участника
+	   							    abc->prio_member=-1;//сбросим приоритет чтобы учасник ьог ответить
+	   							    aipm->state_member=AICS_STATE_IDLE;
+ 	   	   							 if(aipm->scenario==AICS_SCENARIO_SELECTOR){
+ 	                                     //включаем микрофон на инициаторе выключаем на участнике
+   	   							       armtel_set_audio(bridge,bridge_channel);
+ 	     	   						 }
+ 	     	   						 else if(aipm->scenario==AICS_SCENARIO_CIRCULAR){
+ 	                                     //включаем микрофон на инициаторе выключаем на участнике
+   	   							       armtel_set_audio(bridge,bridge_channel);
+ 	     	   						 }
+                      //               armtel_show_audio(bridge);
+   	     						     out.cmd=AICS_ARMTEL_DIRECTION;
+        						     out.context=AICS_CONTEXT_ARMTEL_ACT_LISTEN_BTN_OFF;
+                                     ast_indicate_data(bc->chan,AST_CONTROL_ARMTEL_INTERCOM_SIG,&out,sizeof(out));
+	   						   }
+     					   }
+                         }
+			         }
+		             abc->sig_armtel.cmd = AICS_CMD_NONE;
+		             abc->sig_armtel.send=0;
+	}
 	return 0;
 }
+/* ~AICS/
 
 /*!
  * \internal

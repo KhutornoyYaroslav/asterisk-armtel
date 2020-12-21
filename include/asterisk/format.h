@@ -26,6 +26,8 @@
 #ifndef _AST_FORMAT_H_
 #define _AST_FORMAT_H_
 
+#define ARMTEL_CODEC_DCN
+
 #include "asterisk/astobj2.h"
 #include "asterisk/silk.h"
 #include "asterisk/celt.h"
@@ -104,7 +106,10 @@ enum ast_format_id {
 	AST_FORMAT_CELT             = 29 + AST_FORMAT_TYPE_AUDIO,
 	/*! Opus */
 	AST_FORMAT_OPUS             = 30 + AST_FORMAT_TYPE_AUDIO,
-
+#ifdef	ARMTEL_CODEC_DCN
+	/*!Raw A-law data (G.711) 2timeslot  */
+	AST_FORMAT_ALAWDCN          = 31 + AST_FORMAT_TYPE_AUDIO,
+#endif
 	/*! H.261 Video */
 	AST_FORMAT_H261             = 1 + AST_FORMAT_TYPE_VIDEO,
 	/*! H.263 Video */

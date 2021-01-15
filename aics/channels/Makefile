@@ -24,7 +24,7 @@ OBJS_RADIOHYT = chan_radiohyt.o radiohyt/chan_radiohyt_functions.o radiohyt/moni
 radiohyt: chan_radiohyt.so
 
 chan_radiohyt.so : $(OBJS_RADIOHYT)
-	$(CC) -o $@ $(LFLAGS),--version-script,chan_radiohyt.exports $<
+	$(CC) -o $@ $(LFLAGS),--version-script,chan_radiohyt.exports $^
 
 chan_radiohyt.o : chan_radiohyt.c
 radiohyt/chan_radiohyt_functions.o : radiohyt/chan_radiohyt_functions.c

@@ -290,6 +290,13 @@ const char* aics_get_name_cmd(unsigned char id);
 struct ast_dial; // fast-forward declaration (from dial.h)
 struct ast_dial_channel; // fast-forward declaration (from dial.h)
 
+/*! \brief AICS Request all appended channels, but do not dial
+ * \param dial Dialing structure
+ * \param chan Optional dialing channel
+ * \param cap Optional requested capabilities
+ * \retval -1 failure
+ * \reval 0 success
+ */
 int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast_format_cap *cap);
 
 #endif /* _AICS_H_ */

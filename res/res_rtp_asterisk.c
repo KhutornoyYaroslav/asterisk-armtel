@@ -100,7 +100,6 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 425645 $")
 #define DEFAULT_DTMF_TIMEOUT (150 * (8000 / 1000))	/*!< samples */
 
 #define ZFONE_PROFILE_ID 0x505a
-#define HYTERUS_PROFILE_ID 0x15
 
 #define DEFAULT_LEARNING_MIN_SEQUENTIAL 4
 
@@ -216,7 +215,6 @@ struct ast_rtp {
 	int s;
 	struct ast_frame f;
 	unsigned char rawdata[8192 + AST_FRIENDLY_OFFSET];
-	unsigned int *ext_header;	/*!< RTP Header Extension assigned by application layer, in network-byte-order! */
 	unsigned int ssrc;		/*!< Synchronization source, RFC 3550, page 10. */
 	unsigned int themssrc;		/*!< Their SSRC */
 	unsigned int rxssrc;
@@ -428,8 +426,6 @@ static void ast_rtp_update_source(struct ast_rtp_instance *instance);
 static void ast_rtp_change_source(struct ast_rtp_instance *instance);
 static int ast_rtp_write(struct ast_rtp_instance *instance, struct ast_frame *frame);
 static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtcp);
-static int ast_rtp_extended_prop_set(struct ast_rtp_instance *instance, int property, void *value);
-static void *ast_rtp_extended_prop_get(struct ast_rtp_instance *instance, int property);
 static void ast_rtp_prop_set(struct ast_rtp_instance *instance, enum ast_rtp_property property, int value);
 static int ast_rtp_fd(struct ast_rtp_instance *instance, int rtcp);
 static void ast_rtp_remote_address_set(struct ast_rtp_instance *instance, struct ast_sockaddr *addr);
@@ -1558,8 +1554,6 @@ static struct ast_rtp_engine asterisk_rtp_engine = {
 	.change_source = ast_rtp_change_source,
 	.write = ast_rtp_write,
 	.read = ast_rtp_read,
-	.extended_prop_set = ast_rtp_extended_prop_set,
-	.extended_prop_get = ast_rtp_extended_prop_get,
 	.prop_set = ast_rtp_prop_set,
 	.fd = ast_rtp_fd,
 	.remote_address_set = ast_rtp_remote_address_set,
@@ -2486,7 +2480,6 @@ static int ast_rtp_destroy(struct ast_rtp_instance *instance)
 	struct timespec ts = { .tv_sec = wait.tv_sec, .tv_nsec = wait.tv_usec * 1000, };
 #endif
 
-
 	/* Destroy the smoother that was smoothing out audio if present */
 	if (rtp->smoother) {
 		ast_smoother_free(rtp->smoother);
@@ -3192,47 +3185,12 @@ static int ast_rtp_raw_write(struct ast_rtp_instance *instance, struct ast_frame
 
 	/* If we know the remote address construct a packet and send it out */
 	if (!ast_sockaddr_isnull(&remote_address)) {
-		int hdrlen = 12, ext, ext_hdrlen = 0, res, ice;
-		unsigned char *rtpheader;
-		unsigned int *ptr;
+		int hdrlen = 12, res, ice;
+		unsigned char *rtpheader = (unsigned char *)(frame->data.ptr - hdrlen);
 
-		ext = (rtp->ext_header != NULL);
-		if (ext) {
-			unsigned int profile;
-			profile = (ntohl(rtp->ext_header[0]) & 0xffff0000) >> 16;
-			ext_hdrlen = (ntohl(rtp->ext_header[0]) & 0xffff) << 2;
-			if (profile == HYTERUS_PROFILE_ID) {
-				unsigned int slot, eof, src, rcv, ct;
-
-				ast_assert(ext_hdrlen == 12);
-
-				slot = (ntohl(rtp->ext_header[1]) & 0xfe000000) >> 25;
-				eof  = (ntohl(rtp->ext_header[1]) & 0x01000000) >> 24;
-				src  = (ntohl(rtp->ext_header[1]) & 0x00ffffff);
-				rcv  = (ntohl(rtp->ext_header[2]) & 0xffffff00) >> 8;
-				ct   = (ntohl(rtp->ext_header[2]) & 0x000000ff);
-
-				ast_debug(1, "Send RTP Hyterus Extension: [Slot]:%d, [L]:%d, [Src]:0x%x, [Rcv]:0x%x, [CT]:%d\n",
-					slot, eof, src, rcv, ct);
-			}
-			hdrlen += ext_hdrlen;
-			hdrlen += 4;
-		}
-
-		rtpheader = (unsigned char *)(frame->data.ptr - hdrlen);
-		ptr = (unsigned int *)rtpheader;
-
-		put_unaligned_uint32(ptr++, htonl((2 << 30) | (ext << 28) | (codec << 16) | (rtp->seqno) | (mark << 23)));
-		put_unaligned_uint32(ptr++, htonl(rtp->lastts));
-		put_unaligned_uint32(ptr++, htonl(rtp->ssrc));
-
-		if (ext) {
-			int i = 0;
-			for (; i <= ext_hdrlen / 4; ++i) {
-				put_unaligned_uint32(ptr++, rtp->ext_header[i]);
-			}
-			ast_assert(ptr == frame->data.ptr);
-		}
+		put_unaligned_uint32(rtpheader, htonl((2 << 30) | (codec << 16) | (rtp->seqno) | (mark << 23)));
+		put_unaligned_uint32(rtpheader + 4, htonl(rtp->lastts));
+		put_unaligned_uint32(rtpheader + 8, htonl(rtp->ssrc));
 
 		if ((res = rtp_sendto(instance, (void *)rtpheader, frame->datalen + hdrlen, 0, &remote_address, &ice)) < 0) {
 			if (!ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT) || (ast_rtp_instance_get_prop(instance, AST_RTP_PROPERTY_NAT) && (ast_test_flag(rtp, FLAG_NAT_ACTIVE) == FLAG_NAT_ACTIVE))) {
@@ -4397,74 +4355,6 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	timestamp = ntohl(rtpheader[1]);
 	ssrc = ntohl(rtpheader[2]);
 
-	/* Remove any padding bytes that may be present */
-	if (padding) {
-		res -= rtp->rawdata[AST_FRIENDLY_OFFSET + res - 1];
-	}
-
-	/* Skip over any CSRC fields */
-	if (cc) {
-		hdrlen += cc * 4;
-	}
-
-	/* Look for Hyterus RTP extension */
-	if (ext) {
-		unsigned int profile, length;
-
-		hdrlen += (ntohl(rtpheader[hdrlen/4]) & 0xffff) << 2;
-		hdrlen += 4;
-
-		profile = (ntohl(rtpheader[3]) & 0xffff0000) >> 16;
-		length = ntohl(rtpheader[3]) & 0x0000ffff;
-
-		if (profile == ZFONE_PROFILE_ID) {
-			if (option_debug) {
-				ast_debug(1, "Found Zfone extension in RTP stream - zrtp - not supported.\n");
-			}
-		} else if (profile == HYTERUS_PROFILE_ID) {
-			unsigned int slot_r, eof_r, src_r, rcv_r, ct_r;
-
-			ast_assert(length == 3);
-			if (length == 3) {
-				slot_r = (ntohl(rtpheader[4]) & 0xfe000000) >> 25;
-				eof_r  = (ntohl(rtpheader[4]) & 0x01000000) >> 24;
-				src_r  = (ntohl(rtpheader[4]) & 0x00ffffff);
-				rcv_r  = (ntohl(rtpheader[5]) & 0xffffff00) >> 8;
-				ct_r   = (ntohl(rtpheader[5]) & 0x000000ff);
-
-				ast_debug(1, "Recv RTP Hyterus Extension: [Slot]:%d, [L]:%d, [Src]:0x%x, [Rcv]:0x%x, [CT]:%d\n",
-					slot_r, eof_r, src_r, rcv_r, ct_r);
-			}
-			if (length == 3 && rtp->ext_header) {
-				unsigned int slot_f, eof_f, src_f, rcv_f, ct_f;
-
-				slot_f = (ntohl(rtp->ext_header[1]) & 0xfe000000) >> 25;
-				eof_f  = (ntohl(rtp->ext_header[1]) & 0x01000000) >> 24;
-				src_f  = (ntohl(rtp->ext_header[1]) & 0x00ffffff);
-				rcv_f  = (ntohl(rtp->ext_header[2]) & 0xffffff00) >> 8;
-				ct_f   = (ntohl(rtp->ext_header[2]) & 0x000000ff);
-
-				ast_debug(1, "Filt RTP Hyterus Extension: [Slot]:%d, [L]:%d, [Src]:0x%x, [Rcv]:0x%x, [CT]:%d\n",
-					slot_f, eof_f, src_f, rcv_f, ct_f);
-
-				if (!(src_r == src_f && rcv_r == rcv_f)) {
-					ast_debug(1, "Recv packet does not match filter based on RTP Hyterus Extension, drop it\n");
-					return &ast_null_frame;
-				}
-			}
-		} else {
-			if (option_debug) {
-				ast_debug(1, "Found unknown RTP Extensions 0x%x, length of %d\n", profile, length);
-			}
-		}
-	}
-
-	/* Make sure after we potentially mucked with the header length that it is once again valid */
-	if (res < hdrlen) {
-		ast_log(LOG_WARNING, "RTP Read too short (%d, expecting %d\n", res, hdrlen);
-		return &ast_null_frame;
-	}
-
 	AST_LIST_HEAD_INIT_NOLOCK(&frames);
 	/* Force a marker bit and change SSRC if the SSRC changes */
 	if (rtp->rxssrc && rtp->rxssrc != ssrc) {
@@ -4497,6 +4387,36 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 
 	rtp->rxssrc = ssrc;
 
+	/* Remove any padding bytes that may be present */
+	if (padding) {
+		res -= rtp->rawdata[AST_FRIENDLY_OFFSET + res - 1];
+	}
+
+	/* Skip over any CSRC fields */
+	if (cc) {
+		hdrlen += cc * 4;
+	}
+
+	/* Look for any RTP extensions, currently we do not support any */
+	if (ext) {
+		hdrlen += (ntohl(rtpheader[hdrlen/4]) & 0xffff) << 2;
+		hdrlen += 4;
+		if (option_debug) {
+			unsigned int profile;
+			profile = (ntohl(rtpheader[3]) & 0xffff0000) >> 16;
+			if (profile == 0x505a)
+				ast_debug(1, "Found Zfone extension in RTP stream - zrtp - not supported.\n");
+			else
+				ast_debug(1, "Found unknown RTP Extensions %x\n", profile);
+		}
+	}
+
+	/* Make sure after we potentially mucked with the header length that it is once again valid */
+	if (res < hdrlen) {
+		ast_log(LOG_WARNING, "RTP Read too short (%d, expecting %d\n", res, hdrlen);
+		return AST_LIST_FIRST(&frames) ? AST_LIST_FIRST(&frames) : &ast_null_frame;
+	}
+
 	rtp->rxcount++;
 	if (rtp->rxcount == 1) {
 		rtp->seedrxseqno = seqno;
@@ -4525,7 +4445,7 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 	if (rtp_debug_test_addr(&addr)) {
 		ast_verbose("Got  RTP packet from    %s (type %-2.2d, seq %-6.6u, ts %-6.6u, len %-6.6d)\n",
 			    ast_sockaddr_stringify(&addr),
-			    payloadtype, seqno, timestamp, res - hdrlen);
+			    payloadtype, seqno, timestamp,res - hdrlen);
 	}
 
 	payload = ast_rtp_codecs_payload_lookup(ast_rtp_instance_get_codecs(instance), payloadtype);
@@ -4681,54 +4601,6 @@ static struct ast_frame *ast_rtp_read(struct ast_rtp_instance *instance, int rtc
 
 	AST_LIST_INSERT_TAIL(&frames, &rtp->f, frame_list);
 	return AST_LIST_FIRST(&frames);
-}
-
-static int ast_rtp_extended_prop_set(struct ast_rtp_instance *instance, int property, void *value)
-{
-	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
-
-	if (property == AST_RTP_EXTENSION_HEADER) {
-		if (value) {
-			unsigned int profile;
-
-			rtp->ext_header = (uint32_t *)value;
-			ast_debug(1, "Setup RTP Header Extension on RTP instance '%p'\n", instance);
-
-			profile = (ntohl(rtp->ext_header[0]) & 0xffff0000) >> 16;
-			if (profile == HYTERUS_PROFILE_ID) {
-				unsigned int length, slot, eof, src, rcv, ct;
-
-				length = ntohl(rtp->ext_header[0]) & 0x0000ffff;
-				ast_assert(length == 3);
-				if (length == 3) {
-					slot = (ntohl(rtp->ext_header[1]) & 0xfe000000) >> 25;
-					eof  = (ntohl(rtp->ext_header[1]) & 0x01000000) >> 24;
-					src  = (ntohl(rtp->ext_header[1]) & 0x00ffffff);
-					rcv  = (ntohl(rtp->ext_header[2]) & 0xffffff00) >> 8;
-					ct   = (ntohl(rtp->ext_header[2]) & 0x000000ff);
-
-					ast_verbose("Setup RTP Hyterus Extension: [Slot]:%d [L]:%d, [Src]:%d, [Rcv]: %d, [CT]:%d\n",
-						slot, eof, src, rcv, ct);
-				}
-			}
-		} else {
-			rtp->ext_header = NULL;
-			ast_verbose("Reset RTP Header Extension on RTP instance '%p'\n", instance);
-		}
-		return 0;
-	}
-	return -1;
-}
-
-static void *ast_rtp_extended_prop_get(struct ast_rtp_instance *instance, int property)
-{
-	struct ast_rtp *rtp = ast_rtp_instance_get_data(instance);
-
-	if (property == AST_RTP_EXTENSION_HEADER) {
-		return rtp->ext_header;
-	}
-
-	return NULL;
 }
 
 static void ast_rtp_prop_set(struct ast_rtp_instance *instance, enum ast_rtp_property property, int value)

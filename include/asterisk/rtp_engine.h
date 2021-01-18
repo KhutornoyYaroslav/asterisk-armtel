@@ -119,12 +119,6 @@ enum ast_rtp_property {
 	AST_RTP_PROPERTY_MAX,
 };
 
-/*! Additional RTP extensions */
-enum ast_rtp_extension {
-	/*! Add extension header to the RTP packet */
-	AST_RTP_EXTENSION_HEADER = 0,
-};
-
 /*! Additional RTP options */
 enum ast_rtp_options {
 	/*! Remote side is using non-standard G.726 */

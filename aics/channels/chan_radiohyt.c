@@ -78,6 +78,8 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision$")
 #include "../include/asterisk/config.h"
 #include "../include/asterisk/logger.h"
 
+#include "../include/aics_rtp_engine.h"
+
 #include <strings.h>
 
 #define AST_MODULE "chan_radiohyt"

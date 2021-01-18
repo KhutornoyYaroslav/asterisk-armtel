@@ -287,8 +287,9 @@ const char* aics_get_name_cmd(unsigned char id);
 //void aics_addons_free(struct aics_channel_addons *done);
 //void aics_addons_notice(struct aics_channel_addons *info, char *prefix);
 
+
 struct ast_dial; // fast-forward declaration (from dial.h)
-struct ast_dial_channel; // fast-forward declaration (from dial.h)
+struct ast_format_cap; // fast-forward declaration (from format_cap.h)
 
 /*! \brief AICS Request all appended channels, but do not dial
  * \param dial Dialing structure
@@ -298,5 +299,36 @@ struct ast_dial_channel; // fast-forward declaration (from dial.h)
  * \reval 0 success
  */
 int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast_format_cap *cap);
+
+/*!
+ * \brief AICS Synchronously or asynchronously make an outbound call and send it to a
+ * particular extension
+ *
+ * \param chan The channel originated the call
+ * \param type The channel technology to create
+ * \param cap The format capabilities for the channel
+ * \param addr Address data to pass to the channel technology driver
+ * \param timeout How long we should attempt to dial the outbound channel
+ * \param context The destination context for the outbound channel
+ * \param exten The destination extension for the outbound channel
+ * \param priority The destination priority for the outbound channel
+ * \param reason Optional.  If provided, the dialed status of the outgoing channel.
+ *        Codes are AST_CONTROL_xxx values.  Valid only if synchronous is non-zero.
+ * \param synchronous If zero then don't wait for anything.
+ *        If one then block until the outbound channel answers or the call fails.
+ *        If greater than one then wait for the call to complete or if the call doesn't
+ *        answer and failed@context exists then run a channel named OutgoingSpoolFailed
+ *        at failed@context.
+ * \param cid_num The caller ID number to set on the outbound channel
+ * \param outgoing_chan_name Spawned channel name
+ *
+ * \retval 0 on success
+ * \retval -1 on failure
+ */
+int aics_pbx_outgoing_exten(struct ast_channel *chan, const char *type, struct ast_format_cap *cap,
+	const char *addr, int timeout, const char *context, const char *exten, int priority, int *reason,
+	int synchronous, const char *cid_num, char **outgoing_chan_name);
+
+struct ast_dial* pbx_add_member_armtel_group(struct ast_channel *chan,const char* exten,const char* tech);
 
 #endif /* _AICS_H_ */

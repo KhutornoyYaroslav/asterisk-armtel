@@ -1103,35 +1103,6 @@ int ast_async_goto(struct ast_channel *chan, const char *context, const char *ex
 int ast_async_goto_by_name(const char *chan, const char *context, const char *exten, int priority);
 
 /*!
- * \brief AICS Synchronously or asynchronously make an outbound call and send it to a
- * particular extension
- *
- * \param chan The channel originated the call
- * \param type The channel technology to create
- * \param cap The format capabilities for the channel
- * \param addr Address data to pass to the channel technology driver
- * \param timeout How long we should attempt to dial the outbound channel
- * \param context The destination context for the outbound channel
- * \param exten The destination extension for the outbound channel
- * \param priority The destination priority for the outbound channel
- * \param reason Optional.  If provided, the dialed status of the outgoing channel.
- *        Codes are AST_CONTROL_xxx values.  Valid only if synchronous is non-zero.
- * \param synchronous If zero then don't wait for anything.
- *        If one then block until the outbound channel answers or the call fails.
- *        If greater than one then wait for the call to complete or if the call doesn't
- *        answer and failed@context exists then run a channel named OutgoingSpoolFailed
- *        at failed@context.
- * \param cid_num The caller ID number to set on the outbound channel
- * \param outgoing_chan_name Spawned channel name
- *
- * \retval 0 on success
- * \retval -1 on failure
- */
-int aics_pbx_outgoing_exten(struct ast_channel *chan, const char *type, struct ast_format_cap *cap,
-	const char *addr, int timeout, const char *context, const char *exten, int priority, int *reason,
-	int synchronous, const char *cid_num, char **outgoing_chan_name);
-
-/*!
  * \brief Synchronously or asynchronously make an outbound call and send it to a
  * particular extension
  *
@@ -1598,9 +1569,6 @@ void pbx_live_dangerously(int new_live_dangerously);
  * \return Non-zero if marking current thread failed.
  */
 int ast_thread_inhibit_escalations(void);
-
-struct ast_dial* pbx_add_member_armtel_group(struct ast_channel *chan,const char* exten,const char* tech);
-
 
 #if defined(__cplusplus) || defined(c_plusplus)
 }

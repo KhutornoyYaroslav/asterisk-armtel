@@ -16,6 +16,8 @@
 #include "asterisk/stasis_channels.h"
 
 #include "asterisk/dial.h"
+#include "asterisk/callerid.h"
+#include "asterisk/causes.h"
 
 // prototypes
 //void aics_list_channel_snapshot(void);
@@ -1077,6 +1079,7 @@ ast_log(LOG_NOTICE, "inheritance [%p] %s/%s [%p] %s/%s!\n", channel->owner, ast_
 	return 0;
 }
 
+// NOTE: Can be problems with other Asterisk core versions (works with 12.8.2). See "ast_dial" and "ast_dial_channel" structures in /asterisk/dial.c.
 int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast_format_cap *cap)
 {
 	struct ast_dial_channel *channel;
@@ -1091,5 +1094,364 @@ int aics_dial_prerun(struct ast_dial *dial, struct ast_channel *chan, struct ast
 	AST_LIST_UNLOCK(&dial->channels);
 
 	return res;
+}
+
+// NOTE: Copied from /asterisk/pbx.c. Can be problems with other Asterisk core versions (works with 12.8.2).
+struct pbx_outgoing {
+	/*! \brief Dialing structure being used */
+	struct ast_dial *dial;
+	/*! \brief Condition for synchronous dialing */
+	ast_cond_t cond;
+	/*! \brief Application to execute */
+	char app[AST_MAX_APP];
+	/*! \brief Application data to pass to application */
+	char *appdata;
+	/*! \brief Dialplan context */
+	char context[AST_MAX_CONTEXT];
+	/*! \brief Dialplan extension */
+	char exten[AST_MAX_EXTENSION];
+	/*! \brief Dialplan priority */
+	int priority;
+	/*! \brief Result of the dial operation when dialed is set */
+	int dial_res;
+	/*! \brief Set when dialing is completed */
+	unsigned int dialed:1;
+	/*! \brief Set when execution is completed */
+	unsigned int executed:1;
+};
+
+// NOTE: Copied from /asterisk/pbx.c. Can be problems with other Asterisk core versions (works with 12.8.2).
+static void pbx_outgoing_destroy(void *obj)
+{
+	struct pbx_outgoing *outgoing = obj;
+
+	if (outgoing->dial) {
+		ast_dial_destroy(outgoing->dial);
+	}
+
+	ast_cond_destroy(&outgoing->cond);
+
+	ast_free(outgoing->appdata);
+}
+
+// NOTE: Copied from /asterisk/pbx.c. Can be problems with other Asterisk core versions (works with 12.8.2).
+static void *pbx_outgoing_exec(void *data)
+{
+	RAII_VAR(struct pbx_outgoing *, outgoing, data, ao2_cleanup);
+	enum ast_dial_result res;
+
+	/* Notify anyone interested that dialing is complete */
+	res = ast_dial_run(outgoing->dial, NULL, 0);
+	ao2_lock(outgoing);
+	outgoing->dial_res = res;
+	outgoing->dialed = 1;
+	ast_cond_signal(&outgoing->cond);
+	ao2_unlock(outgoing);
+
+	/* If the outgoing leg was not answered we can immediately return and go no further */
+	if (res != AST_DIAL_RESULT_ANSWERED) {
+		return NULL;
+	}
+
+	if (!ast_strlen_zero(outgoing->app)) {
+		struct ast_app *app = pbx_findapp(outgoing->app);
+
+		if (app) {
+			ast_verb(4, "Launching %s(%s) on %s\n", outgoing->app, S_OR(outgoing->appdata, ""),
+				ast_channel_name(ast_dial_answered(outgoing->dial)));
+			pbx_exec(ast_dial_answered(outgoing->dial), app, outgoing->appdata);
+		} else {
+			ast_log(LOG_WARNING, "No such application '%s'\n", outgoing->app);
+		}
+	} else {
+		struct ast_channel *answered = ast_dial_answered(outgoing->dial);
+
+		if (!ast_strlen_zero(outgoing->context)) {
+			ast_channel_context_set(answered, outgoing->context);
+		}
+
+		if (!ast_strlen_zero(outgoing->exten)) {
+			ast_channel_exten_set(answered, outgoing->exten);
+		}
+
+		if (outgoing->priority > 0) {
+			ast_channel_priority_set(answered, outgoing->priority);
+		}
+
+		if (ast_pbx_run(answered)) {
+			ast_log(LOG_ERROR, "Failed to start PBX on %s\n", ast_channel_name(answered));
+		} else {
+			/* PBX will have taken care of hanging up, so we steal the answered channel so dial doesn't do it */
+			ast_dial_answered_steal(outgoing->dial);
+		}
+	}
+
+	/* Notify anyone else again that may be interested that execution is complete */
+	ao2_lock(outgoing);
+	outgoing->executed = 1;
+	ast_cond_signal(&outgoing->cond);
+	ao2_unlock(outgoing);
+
+	return NULL;
+}
+
+// NOTE: Copied from /asterisk/pbx.c. Can be problems with other Asterisk core versions (works with 12.8.2).
+static enum ast_control_frame_type pbx_dial_reason(enum ast_dial_result dial_result, int cause)
+{
+	enum ast_control_frame_type pbx_reason;
+
+	if (dial_result == AST_DIAL_RESULT_ANSWERED) {
+		/* Remote end answered. */
+		pbx_reason = AST_CONTROL_ANSWER;
+	} else if (dial_result == AST_DIAL_RESULT_HANGUP) {
+		/* Caller hungup */
+		pbx_reason = AST_CONTROL_HANGUP;
+	} else {
+		switch (cause) {
+		case AST_CAUSE_USER_BUSY:
+			pbx_reason = AST_CONTROL_BUSY;
+			break;
+		case AST_CAUSE_CALL_REJECTED:
+		case AST_CAUSE_NETWORK_OUT_OF_ORDER:
+		case AST_CAUSE_DESTINATION_OUT_OF_ORDER:
+		case AST_CAUSE_NORMAL_TEMPORARY_FAILURE:
+		case AST_CAUSE_SWITCH_CONGESTION:
+		case AST_CAUSE_NORMAL_CIRCUIT_CONGESTION:
+			pbx_reason = AST_CONTROL_CONGESTION;
+			break;
+		case AST_CAUSE_ANSWERED_ELSEWHERE:
+		case AST_CAUSE_NO_ANSWER:
+			/* Remote end was ringing (but isn't anymore) */
+			pbx_reason = AST_CONTROL_RINGING;
+			break;
+		case AST_CAUSE_UNALLOCATED:
+		default:
+			/* Call Failure (not BUSY, and not NO_ANSWER, maybe Circuit busy or down?) */
+			pbx_reason = 0;
+			break;
+		}
+	}
+
+	return pbx_reason;
+}
+
+// NOTE: Can be problems with other Asterisk core versions (works with 12.8.2).
+static int aics_outgoing_attempt(struct ast_channel *chan, const char *type, struct ast_format_cap *cap,
+	const char *addr, int timeout, const char *context, const char *exten, int priority,
+	int *reason, int synchronous, const char *cid_num, char **outgoing_chan_name)
+{
+	RAII_VAR(struct pbx_outgoing *, outgoing, NULL, ao2_cleanup);
+	struct ast_channel *dialed;
+	pthread_t thread;
+
+	outgoing = ao2_alloc(sizeof(*outgoing), pbx_outgoing_destroy);
+	if (!outgoing) {
+		return -1;
+	}
+	ast_cond_init(&outgoing->cond, NULL);
+
+	ast_copy_string(outgoing->context, context, sizeof(outgoing->context));
+	ast_copy_string(outgoing->exten, exten, sizeof(outgoing->exten));
+	outgoing->priority = priority;
+
+
+	if (!(outgoing->dial = ast_dial_create())) {
+		return -1;
+	}
+
+	if (ast_dial_append(outgoing->dial, type, addr, NULL)) {
+		return -1;
+	}
+
+	ast_dial_set_global_timeout(outgoing->dial, timeout);
+
+ast_log(LOG_NOTICE, "%s cid %s\n", ast_channel_name(chan), cid_num);
+//aics_addons_notice(ast_channel_addons(chan), "aics_outgoing_attempt");
+	if (aics_dial_prerun(outgoing->dial, chan, cap)) {
+		if (synchronous && reason) {
+			*reason = pbx_dial_reason(AST_DIAL_RESULT_FAILED,
+				ast_dial_reason(outgoing->dial, 0));
+		}
+		return -1;
+	}
+
+	dialed = ast_dial_get_channel(outgoing->dial, 0);
+	if (!dialed) {
+		return -1;
+	}
+
+	ast_channel_lock(dialed);
+	ast_set_flag(ast_channel_flags(dialed), AST_FLAG_ORIGINATED);
+	ast_channel_unlock(dialed);
+
+	if (!ast_strlen_zero(cid_num)) {
+		struct ast_party_connected_line connected;
+
+		/*
+		 * It seems strange to set the CallerID on an outgoing call leg
+		 * to whom we are calling, but this function's callers are doing
+		 * various Originate methods.  This call leg goes to the local
+		 * user.  Once the called party answers, the dialplan needs to
+		 * be able to access the CallerID from the CALLERID function as
+		 * if the called party had placed this call.
+		 */
+		ast_set_callerid(dialed, cid_num, NULL, cid_num);
+
+		ast_party_connected_line_set_init(&connected, ast_channel_connected(dialed));
+		if (!ast_strlen_zero(cid_num)) {
+			connected.id.number.valid = 1;
+			connected.id.number.str = (char *) cid_num;
+			connected.id.number.presentation = AST_PRES_ALLOWED_USER_NUMBER_NOT_SCREENED;
+		}
+
+		ast_channel_set_connected_line(dialed, &connected, NULL);
+	}
+
+	ao2_ref(outgoing, +1);
+	if (ast_pthread_create_detached(&thread, NULL, pbx_outgoing_exec, outgoing)) {
+		ast_log(LOG_WARNING, "Unable to spawn dialing thread for '%s/%s'\n", type, addr);
+		ao2_ref(outgoing, -1);
+		return -1;
+	}
+
+	if (synchronous) {
+		ao2_lock(outgoing);
+		/* Wait for dialing to complete */
+		while (!outgoing->dialed) {
+			ast_cond_wait(&outgoing->cond, ao2_object_get_lockaddr(outgoing));
+		}
+		if (1 < synchronous
+			&& outgoing->dial_res == AST_DIAL_RESULT_ANSWERED) {
+			/* Wait for execution to complete */
+			while (!outgoing->executed) {
+				ast_cond_wait(&outgoing->cond, ao2_object_get_lockaddr(outgoing));
+			}
+		}
+		ao2_unlock(outgoing);
+
+		/* Determine the outcome of the dialing attempt up to it being answered. */
+		if (reason) {
+			*reason = pbx_dial_reason(outgoing->dial_res,
+				ast_dial_reason(outgoing->dial, 0));
+		}
+
+		if (outgoing->dial_res != AST_DIAL_RESULT_ANSWERED) {
+			/* The dial operation failed. */
+			return -1;
+		} else {
+			*outgoing_chan_name = ast_strdup(ast_channel_name(dialed));
+		}
+
+	}
+
+	return 0;
+}
+
+// NOTE: Can be problems with other Asterisk core versions (works with 12.8.2).
+int aics_pbx_outgoing_exten(struct ast_channel *chan, const char *type, struct ast_format_cap *cap,
+	const char *addr, int timeout, const char *context, const char *exten, int priority, int *reason,
+	int synchronous, const char *cid_num, char **outgoing_chan_name)
+{
+	int res;
+	int my_reason;
+	//char *my_channame = NULL;
+
+	if (!reason) {
+		reason = &my_reason;
+	}
+	*reason = 0;
+
+//	if(!outgoing_chan_name) {
+//		my_channame = ast_alloca(128);
+//		outgoing_chan_name = &my_channame;
+//	}
+//	*outgoing_chan_name = "";
+
+	res = aics_outgoing_attempt(chan, type, cap, addr, timeout, context, exten, priority,
+		reason, synchronous, cid_num, outgoing_chan_name);
+
+	if (res < 0 /* Call failed to get connected for some reason. */
+		&& 1 < synchronous
+		&& ast_exists_extension(NULL, context, "failed", 1, NULL)) {
+		struct ast_channel *failed;
+
+		/* We do not have to worry about a locked_channel if dialing failed. */
+		ast_assert(!locked_channel || !*locked_channel);
+
+		/*!
+		 * \todo XXX Not good.  The channel name is not unique if more than
+		 * one originate fails at a time.
+		 */
+		failed = ast_channel_alloc(0, AST_STATE_DOWN, cid_num, NULL, NULL,
+			"failed", context, NULL, NULL, 0, "OutgoingSpoolFailed");
+		if (failed) {
+			char failed_reason[12];
+
+			//ast_set_variables(failed, vars);
+			snprintf(failed_reason, sizeof(failed_reason), "%d", *reason);
+			pbx_builtin_setvar_helper(failed, "REASON", failed_reason);
+			ast_channel_unlock(failed);
+
+			if (ast_pbx_run(failed)) {
+				ast_log(LOG_ERROR, "Unable to run PBX on '%s'\n",
+					ast_channel_name(failed));
+				ast_hangup(failed);
+			}
+		}
+	}
+
+	return res;
+}
+
+// NOTE: Can be problems with other Asterisk core versions (works with 12.8.2).
+static void armtel_group_callback(struct ast_dial *dial)
+{
+	struct ast_channel *chan;
+//	struct page_options *options;
+
+	if (ast_dial_state(dial) != AST_DIAL_RESULT_ANSWERED ||
+	    !(chan = ast_dial_answered(dial)) ) {
+		return;
+	}
+
+//ast_log(LOG_WARNING, "----callback=%s\n",ast_channel_name(chan));
+
+	ast_func_write(chan, "CONFBRIDGE(user,template)", "");
+	ast_func_write(chan, "CONFBRIDGE(user,quiet)", "yes");
+	ast_func_write(chan, "CONFBRIDGE(user,end_marked)", "yes");
+	ast_func_write(chan, "CONFBRIDGE(user,startmuted)", "yes");
+
+}
+
+// NOTE: Can be problems with other Asterisk core versions (works with 12.8.2).
+struct ast_dial* pbx_add_member_armtel_group(struct ast_channel *chan,const char* exten,const char* tech)
+{
+char confbridgeopts[128];
+struct ast_dial *dial = NULL;
+
+        strcpy(confbridgeopts,"ConfBridge,");
+        strcat(confbridgeopts,ast_channel_data(chan));
+// ast_log(LOG_WARNING, "----ADD=%s;ext=%s;tech=%s\n",confbridgeopts,exten,tech);
+
+		if (!(dial = ast_dial_create())) {
+			ast_log(LOG_WARNING, "Failed to create dialing structure.\n");
+			return 0;
+		}
+//	ast_log(LOG_WARNING, "ast_dial_create.=%X[%X]\n",dial,exten);
+
+		if (ast_dial_append(dial, tech, exten, NULL) == -1) {
+			ast_log(LOG_ERROR, "Failed to add %s to outbound dial\n", tech);
+			ast_dial_destroy(dial);
+			return 0;
+		}
+
+		ast_dial_option_global_enable(dial, AST_DIAL_OPTION_ANSWER_EXEC, confbridgeopts);
+	//	ast_dial_option_global_enable(dial, 1, confbridgeopts);
+
+		ast_dial_set_state_callback(dial, &armtel_group_callback);
+//		ast_dial_set_user_data(dial, &options);
+
+		ast_dial_run(dial, chan, 1);
+       return dial;
 }
 
